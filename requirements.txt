@@ -1,0 +1,4 @@
+openai>=1.40
+meta-sam-parser
+opencv-python
+numpy
