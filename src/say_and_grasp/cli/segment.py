@@ -14,7 +14,7 @@ import cv2
 
 from ..camera import capture
 from ..paths import output
-from ..sam import draw_overlay, grasp_from_mask, segment
+from ..sam import draw_overlay, grasp_from_mask, segment_robust
 
 
 def main() -> None:
@@ -32,7 +32,7 @@ def main() -> None:
     else:
         img = capture(args.camera)
 
-    dets = segment(img, args.prompt)
+    dets, _ = segment_robust(img, args.prompt)
     if not dets:
         print(f"No '{args.prompt}' found.")
         cv2.imwrite(str(output("segment.png")), img)

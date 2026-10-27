@@ -29,7 +29,7 @@ from ..calibration import load_calib, pixel_dir_to_base, pixel_to_base, shade_re
 from ..camera import capture
 from ..kinematics import Kinematics
 from ..paths import CALIB_FILE, URDF_FILE, output
-from ..sam import draw_overlay, grasp_from_mask, segment
+from ..sam import draw_overlay, grasp_from_mask, segment_robust
 
 
 def main() -> None:
@@ -89,7 +89,7 @@ def main() -> None:
 
     # 1. Look
     frame = capture(camera)
-    dets = segment(frame, args.prompt)
+    dets, _ = segment_robust(frame, args.prompt)
     if not dets:
         if arm:
             arm.disconnect()

@@ -8,7 +8,8 @@ It fits a homography (pixel -> table x, y in metres) plus the table height and s
 config/calib.json. Spread the points over the whole working area: the mapping is accurate
 inside the area they cover and gets worse outside it.
 
-    sag-calibrate --camera 5 --marker "coin"
+    sag-calibrate --camera 5 --marker "blue block"
+    sag-calibrate --refit --drop 7,8      # re-solve from saved points, leaving out bad ones
 
 Torque is switched OFF so you can move the arm by hand. It sags when you let go, so keep
 a hand on it.
@@ -25,16 +26,16 @@ import cv2
 import numpy as np
 
 from ..arm import Arm
-from ..calibration import fit_homography, save_calib
+from ..calibration import fit_homography, load_calib, save_calib
 from ..camera import capture
 from ..kinematics import Kinematics
 from ..paths import CALIB_FILE, URDF_FILE, output
-from ..sam import draw_overlay, grasp_from_mask, segment
+from ..sam import draw_overlay, grasp_from_mask, segment_robust
 
 
 def locate_marker(frame: np.ndarray, prompt: str, save_as: Path) -> tuple[float, float] | None:
     """Find the marker with SAM 3.1 and return its mask centroid. Asks you if it's ambiguous."""
-    dets = segment(frame, prompt)
+    dets, _ = segment_robust(frame, prompt)
     grasps = [grasp_from_mask(d.mask) for d in dets]
     cv2.imwrite(str(save_as), draw_overlay(frame, dets, grasps) if dets else frame)
 
@@ -65,7 +66,7 @@ def locate_marker(frame: np.ndarray, prompt: str, save_as: Path) -> tuple[float,
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--camera", required=True, help="overhead camera index (e.g. 5) or /dev/v4l/by-id/... path")
+    ap.add_argument("--camera", help="overhead camera index (e.g. 5) or /dev/v4l/by-id/... path")
     ap.add_argument("--marker", default="coin", help='SAM prompt for your marker, e.g. "coin", "bottle cap"')
     ap.add_argument("--port", default="/dev/ttyACM0", help="follower arm serial port")
     ap.add_argument("--robot-id", default="my_follower")
@@ -73,7 +74,27 @@ def main() -> None:
     ap.add_argument("--mjpg", action="store_true", help="force MJPG (only if two cameras fight over USB bandwidth)")
     ap.add_argument("--urdf", default=str(URDF_FILE))
     ap.add_argument("--out", default=str(CALIB_FILE))
+    ap.add_argument("--refit", action="store_true", help="re-solve from the points saved in --out")
+    ap.add_argument("--drop", default="", help="with --refit: point numbers to leave out, e.g. 7,8")
     args = ap.parse_args()
+
+    if args.refit:
+        old = load_calib(args.out)
+        drop = {int(x) for x in args.drop.split(",") if x.strip()}
+        pts = [p for k, p in enumerate(old.get("all_points", old["points"]), start=1) if k not in drop]
+        if len(pts) < 4:
+            sys.exit("Need at least 4 points left.")
+        print(f"Refitting with {len(pts)} points (dropped {sorted(drop) or 'none'}).")
+        solve_and_save([p["pixel"] for p in pts], [p["base_xyz"] for p in pts], [p["tilt_deg"] for p in pts],
+                       old["camera"], old["image_size"], old["urdf"], args.out)
+        # keep the full original set so point numbers stay stable across refits
+        new = load_calib(args.out)
+        new["all_points"] = old.get("all_points", old["points"])
+        new["dropped"] = sorted(drop)
+        save_calib(new, args.out)
+        return
+    if not args.camera:
+        sys.exit("--camera is required")
 
     if not Path(args.urdf).exists():
         sys.exit(f"URDF not found at {args.urdf}. See the README (assets/SO101).")
@@ -132,6 +153,10 @@ def main() -> None:
     finally:
         arm.disconnect()
 
+    solve_and_save(pixels, points, tilts, args.camera, image_size, args.urdf, args.out)
+
+
+def solve_and_save(pixels, points, tilts, camera, image_size, urdf, out) -> None:
     pixels_a = np.array(pixels, dtype=float)
     points_a = np.array(points, dtype=float)
     H, fit_err, loo_err = fit_homography(pixels_a, points_a[:, :2])
@@ -146,25 +171,26 @@ def main() -> None:
     # Leave-one-out at a corner point measures extrapolation, so judge by the median.
     typical = np.nanmedian(loo_err) if not np.all(np.isnan(loo_err)) else float(np.median(fit_err))
     print(f"Typical error (median leave-one-out): {typical*1000:.1f} mm  ->  "
-          + ("good" if typical < 0.005 else "OK, usable" if typical < 0.010 else "too high, redo (check clicks and tilt)"))
-    print("Points with a much larger error than the rest were probably found off-centre or touched off-centre.")
+          + ("good" if typical < 0.005 else "OK, usable" if typical < 0.010 else "too high: refit with --drop, or redo"))
+    print("A point with a much larger error than the rest was probably bumped or touched off-centre;")
+    print("leave it out with: sag-calibrate --refit --drop N")
 
     save_calib(
         {
             "homography": H.tolist(),
             "table_z": table_z,
-            "camera": str(args.camera),
+            "camera": str(camera),
             "image_size": image_size,
-            "urdf": args.urdf,
+            "urdf": urdf,
             "points": [{"pixel": list(map(float, px)), "base_xyz": list(map(float, p)), "tilt_deg": float(t)}
                        for px, p, t in zip(pixels_a, points_a, tilts)],
             "fit_err_mm": (fit_err * 1000).round(2).tolist(),
             "loo_err_mm": [None if np.isnan(x) else round(float(x) * 1000, 2) for x in loo_err],
             "created": time.strftime("%Y-%m-%d %H:%M:%S"),
         },
-        args.out,
+        out,
     )
-    print(f"Saved {args.out}")
+    print(f"Saved {out}")
 
 
 if __name__ == "__main__":

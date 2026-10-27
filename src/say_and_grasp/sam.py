@@ -141,6 +141,40 @@ def segment(img_bgr: np.ndarray, prompt: str, client=None) -> list[Detection]:
     return parse_output(text, sent_shape, (oh, ow))
 
 
+def prompt_variants(prompt: str) -> list[str]:
+    """Simpler fallbacks for a prompt. SAM 3.1 can miss "blue lego block" yet find "blue block".
+
+    Tries the prompt as given, then without brand/filler words, then the colour + last noun,
+    then the last noun alone.
+    """
+    filler = {"lego", "a", "an", "the", "my", "small", "little", "big", "piece", "of"}
+    words = prompt.lower().split()
+    variants = [prompt]
+    trimmed = [w for w in words if w not in filler]
+    if trimmed:
+        variants.append(" ".join(trimmed))
+        if len(trimmed) > 2:
+            variants.append(" ".join([trimmed[0], trimmed[-1]]))
+        variants.append(trimmed[-1])
+    seen, out = set(), []
+    for v in variants:
+        if v and v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
+
+def segment_robust(img_bgr: np.ndarray, prompt: str) -> tuple[list[Detection], str]:
+    """segment() with automatic prompt fallbacks. Returns (detections, the prompt that worked)."""
+    for p in prompt_variants(prompt):
+        dets = segment(img_bgr, p)
+        if dets:
+            if p != prompt:
+                print(f"[sam] '{prompt}' found nothing; '{p}' worked", file=sys.stderr)
+            return dets, p
+    return [], prompt
+
+
 def grasp_from_mask(mask: np.ndarray) -> GraspTarget | None:
     """Top-down grasp: centroid + principal axes from image moments."""
     m = cv2.moments(mask.astype(np.uint8), binaryImage=True)
