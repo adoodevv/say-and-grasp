@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "say-and-grasp"
+version = "0.1.0"
+description = "A voice-driven third hand for your workbench: SO-101 arm + Meta Muse Spark and SAM 3.1."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = [
+    "openai>=1.40",
+    "meta-sam-parser",
+    "numpy",
+    "placo",
+    # OpenCV: the LeRobot env already ships opencv-python-headless; install one yourself otherwise.
+]
+
+[project.optional-dependencies]
+# Arm control. Install LeRobot from its repo (pip install -e ~/lerobot[feetech]) or:
+robot = ["lerobot[feetech]"]
+
+[project.scripts]
+sag-segment = "say_and_grasp.cli.segment:main"
+sag-calibrate = "say_and_grasp.cli.calibrate:main"
+sag-pick = "say_and_grasp.cli.pick:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

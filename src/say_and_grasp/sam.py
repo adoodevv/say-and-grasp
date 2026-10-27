@@ -1,22 +1,10 @@
-#!/usr/bin/env python3
-"""SAM 3.1 client for Say-and-Grasp.
+"""SAM 3.1 through Meta Model API: text prompt -> masks -> top-down grasp targets.
 
-Segments objects named by a short text prompt (e.g. "blue lego block") through
-Meta Model API, decodes the masks into full-frame numpy arrays, and computes a
-top-down grasp target (pixel centroid + gripper yaw) for each object.
-
-Usage:
-    export META_API_KEY=...
-    python sam_client.py --image frame.jpg --prompt "blue lego block"
-    python sam_client.py --camera 0 --prompt "blue lego block"
-
-Writes <name>_overlay.png next to the input (or sam_overlay.png for --camera).
-
-Requires: pip install openai meta-sam-parser opencv-python numpy
+segment(image, "side cutters") returns Detections with full-frame masks in the original
+image's coordinates; grasp_from_mask() turns a mask into a centroid + gripper yaw.
 """
 from __future__ import annotations
 
-import argparse
 import base64
 import math
 import os
@@ -110,11 +98,24 @@ def parse_output(output_text: str, sent_shape: tuple[int, int], orig_shape: tupl
     return detections
 
 
+_client = None
+
+
+def get_client():
+    """One shared OpenAI-compatible client for Meta Model API (reads META_API_KEY)."""
+    global _client
+    if _client is None:
+        from openai import OpenAI
+
+        if "META_API_KEY" not in os.environ:
+            raise RuntimeError("Set META_API_KEY first (export META_API_KEY=...)")
+        _client = OpenAI(base_url=BASE_URL, api_key=os.environ["META_API_KEY"])
+    return _client
+
+
 def segment(img_bgr: np.ndarray, prompt: str, client=None) -> list[Detection]:
     """Segment every instance of `prompt` in a BGR image. Returns [] when nothing matches."""
-    from openai import OpenAI
-
-    client = client or OpenAI(base_url=BASE_URL, api_key=os.environ["META_API_KEY"])
+    client = client or get_client()
     data_url, scale = _encode_image(img_bgr)
     oh, ow = img_bgr.shape[:2]
     sent_shape = (round(oh * scale), round(ow * scale)) if scale < 1.0 else (oh, ow)
@@ -175,46 +176,3 @@ def draw_overlay(img_bgr: np.ndarray, dets: list[Detection], grasps: list[GraspT
             cv2.line(out, p1, p2, (0, 0, 255), 2)  # red line = where the jaws close
             cv2.circle(out, (int(g.u), int(g.v)), 4, (0, 0, 255), -1)
     return out
-
-
-def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    src = ap.add_mutually_exclusive_group(required=True)
-    src.add_argument("--image", help="path to an image file")
-    src.add_argument("--camera", type=int, help="OpenCV camera index, e.g. 0")
-    ap.add_argument("--prompt", required=True, help='short noun phrase, e.g. "blue lego block"')
-    args = ap.parse_args()
-
-    if "META_API_KEY" not in os.environ:
-        sys.exit("Set META_API_KEY first (export META_API_KEY=...)")
-
-    if args.image:
-        img = cv2.imread(args.image)
-        if img is None:
-            sys.exit(f"Could not read {args.image}")
-        out_path = os.path.splitext(args.image)[0] + "_overlay.png"
-    else:
-        cap = cv2.VideoCapture(args.camera)
-        for _ in range(5):  # let auto-exposure settle
-            ok, img = cap.read()
-        cap.release()
-        if not ok:
-            sys.exit(f"Could not read from camera {args.camera}")
-        out_path = "sam_overlay.png"
-
-    dets = segment(img, args.prompt)
-    if not dets:
-        print(f"No '{args.prompt}' found.")
-        return
-    grasps = [grasp_from_mask(d.mask) for d in dets]
-    for d, g in zip(dets, grasps):
-        conf = f"{d.confidence:.2f}" if d.confidence is not None else "n/a"
-        print(f"object {d.object_id}: conf={conf} box={tuple(round(x) for x in d.box)} mask_px={int(d.mask.sum())}")
-        if g:
-            print(f"   grasp at pixel ({g.u:.0f}, {g.v:.0f}), yaw {g.yaw_deg:.0f} deg, width {g.width_px:.0f}px")
-    cv2.imwrite(out_path, draw_overlay(img, dets, grasps))
-    print(f"Overlay saved to {out_path}")
-
-
-if __name__ == "__main__":
-    main()

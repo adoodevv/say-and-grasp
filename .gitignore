@@ -1,5 +1,16 @@
+# Python
 .venv/
-.env
 __pycache__/
-*_overlay.png
-sam_overlay.png
+*.egg-info/
+build/
+
+# Secrets
+.env
+
+# Large / third-party assets (fetched per README)
+assets/SO101/
+
+# Debug images and logs
+outputs/
+*.png
+!docs/**/*.png
