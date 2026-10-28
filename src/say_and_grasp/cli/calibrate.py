@@ -10,6 +10,7 @@ inside the area they cover and gets worse outside it.
 
     sag-calibrate --camera 5 --marker "blue block"
     sag-calibrate --refit --drop 7,8      # re-solve from saved points, leaving out bad ones
+    sag-calibrate --tcp                   # measure your gripper's grasp centre (do this FIRST)
 
 Torque is switched OFF so you can move the arm by hand. It sags when you let go, so keep
 a hand on it.
@@ -26,10 +27,10 @@ import cv2
 import numpy as np
 
 from ..arm import Arm
-from ..calibration import fit_homography, load_calib, save_calib
+from ..calibration import fit_homography, fit_table_plane, load_calib, save_calib
 from ..camera import capture
-from ..kinematics import Kinematics
-from ..paths import CALIB_FILE, URDF_FILE, output
+from ..kinematics import Kinematics, solve_tcp_offset
+from ..paths import CALIB_FILE, TOOL_FILE, URDF_FILE, output
 from ..sam import draw_overlay, grasp_from_mask, segment_robust
 
 
@@ -64,6 +65,52 @@ def locate_marker(frame: np.ndarray, prompt: str, save_as: Path) -> tuple[float,
     return None
 
 
+def measure_tcp(args) -> None:
+    """Touch ONE fixed point with the grasp centre at several wrist twists; solve the offset."""
+    import json
+
+    if not Path(args.urdf).exists():
+        sys.exit(f"URDF not found at {args.urdf}. See the README (assets/SO101).")
+    kin = Kinematics(args.urdf, tcp_offset=np.zeros(3))  # raw tip frame
+    arm = Arm(args.port, args.robot_id)
+    print(
+        "\nMeasuring the gripper's grasp centre.\n"
+        "  Put a small, fixed target on the table (a dot drawn on paper taped down works best).\n"
+        "  Each time: close the jaws, point the gripper straight down, and touch the target with\n"
+        "  the point MIDWAY BETWEEN THE JAW TIPS. Twist the wrist to a different angle each time\n"
+        "  (roughly -60, 0, +60 deg, and a fourth anywhere). Keep the target itself still.\n"
+    )
+    input("Hold the arm (torque goes OFF), then Enter... ")
+    arm.connect()
+    arm.robot.bus.disable_torque()
+    poses = []
+    try:
+        while len(poses) < 4:
+            input(f"  touch {len(poses) + 1}/4: grasp centre on the target? Enter... ")
+            q = arm.joints()
+            T = kin.fk(q)
+            tilt = math.degrees(math.acos(float(np.clip(-T[2, 2], -1, 1))))
+            print(f"    wrist_roll {q[4]:6.1f} deg, tilt {tilt:4.1f} deg")
+            if poses:
+                rolls = [p[1] for p in poses]
+                if min(abs(q[4] - r) for r in rolls) < 20:
+                    print("    ! too close to an earlier wrist angle; twist further and redo")
+                    continue
+            poses.append((T, q[4]))
+    finally:
+        arm.disconnect()
+
+    d, c, res = solve_tcp_offset([T for T, _ in poses])
+    print(f"\nGrasp centre offset (tool frame): x {d[0]*1000:+.1f} mm, y {d[1]*1000:+.1f} mm "
+          f"(|d| = {np.linalg.norm(d)*1000:.1f} mm)")
+    print("Consistency per touch: " + ", ".join(f"{r*1000:.1f}" for r in res) + " mm "
+          + ("(good)" if res.max() < 0.004 else "(noisy: redo more carefully)"))
+    TOOL_FILE.parent.mkdir(parents=True, exist_ok=True)
+    TOOL_FILE.write_text(json.dumps({"tcp_offset": d.round(5).tolist(), "residual_mm": (res * 1000).round(2).tolist(),
+                                     "created": time.strftime("%Y-%m-%d %H:%M:%S")}, indent=2))
+    print(f"Saved {TOOL_FILE}. Now redo the camera calibration: sag-calibrate --camera N --marker \"blue block\"")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--camera", help="overhead camera index (e.g. 5) or /dev/v4l/by-id/... path")
@@ -76,7 +123,12 @@ def main() -> None:
     ap.add_argument("--out", default=str(CALIB_FILE))
     ap.add_argument("--refit", action="store_true", help="re-solve from the points saved in --out")
     ap.add_argument("--drop", default="", help="with --refit: point numbers to leave out, e.g. 7,8")
+    ap.add_argument("--tcp", action="store_true", help="measure the gripper's grasp centre (writes config/tool.json)")
     args = ap.parse_args()
+
+    if args.tcp:
+        measure_tcp(args)
+        return
 
     if args.refit:
         old = load_calib(args.out)
@@ -112,7 +164,7 @@ def main() -> None:
     arm.robot.bus.disable_torque()
 
     def tip_pose() -> tuple[np.ndarray, float]:
-        T = kin.fk(arm.joints())
+        T = kin.fk_tcp(arm.joints())  # grasp centre, if config/tool.json exists
         tilt = math.degrees(math.acos(float(np.clip(-T[2, 2], -1, 1))))  # 0 = tool straight down
         return T[:3, 3].copy(), tilt
 
@@ -167,7 +219,11 @@ def solve_and_save(pixels, points, tilts, camera, image_size, urdf, out) -> None
         loo = f"{l*1000:5.1f} mm" if not np.isnan(l) else "   n/a"
         print(f"{k+1:>4}   ({u:4.0f},{v:4.0f})   ({p[0]*1000:6.0f},{p[1]*1000:6.0f})   {e*1000:5.1f} mm   {loo}")
     z_spread = (points_a[:, 2].max() - points_a[:, 2].min()) * 1000
+    plane = fit_table_plane(points_a)
+    plane_res = points_a[:, 2] - (np.c_[points_a[:, :2], np.ones(len(points_a))] @ plane)
     print(f"\nTable height z = {table_z*1000:.0f} mm (spread {z_spread:.0f} mm across touches)")
+    print(f"Table plane: tilts {plane[0]*100:+.1f} mm per 10 cm in x, {plane[1]*100:+.1f} mm per 10 cm in y; "
+          f"touches within {np.abs(plane_res).max()*1000:.1f} mm of it")
     # Leave-one-out at a corner point measures extrapolation, so judge by the median.
     typical = np.nanmedian(loo_err) if not np.all(np.isnan(loo_err)) else float(np.median(fit_err))
     print(f"Typical error (median leave-one-out): {typical*1000:.1f} mm  ->  "
@@ -179,6 +235,7 @@ def solve_and_save(pixels, points, tilts, camera, image_size, urdf, out) -> None
         {
             "homography": H.tolist(),
             "table_z": table_z,
+            "table_plane": plane.tolist(),
             "camera": str(camera),
             "image_size": image_size,
             "urdf": urdf,

@@ -10,8 +10,10 @@ import numpy as np
 
 from .paths import CALIB_FILE
 
-# Rough annulus the SO-101 can reach with a straight-down grasp (metres from the base).
-REACH_MIN, REACH_MAX = 0.12, 0.28
+# Annulus the SO-101 can grasp straight down in (metres from the base). Inside ~16 cm the arm
+# has to fold so far that a parallel gripper's base hits the arm; beyond ~28 cm the wrist runs
+# out of range.
+REACH_MIN, REACH_MAX = 0.16, 0.28
 
 
 def load_calib(path: str | Path = CALIB_FILE) -> dict:
@@ -27,11 +29,28 @@ def save_calib(calib: dict, path: str | Path = CALIB_FILE) -> None:
     path.write_text(json.dumps(calib, indent=2))
 
 
+def fit_table_plane(xyz: np.ndarray) -> np.ndarray:
+    """Least-squares plane z = a*x + b*y + c through the calibration touches."""
+    A = np.c_[xyz[:, 0], xyz[:, 1], np.ones(len(xyz))]
+    coef, *_ = np.linalg.lstsq(A, xyz[:, 2], rcond=None)
+    return coef
+
+
+def table_z_at(x: float, y: float, calib: dict) -> float:
+    """Table height under (x, y) in the arm frame. The table is rarely level relative to the
+    arm model, so use the fitted plane when there is one."""
+    if "table_plane" in calib:
+        a, b, c = calib["table_plane"]
+        return float(a * x + b * y + c)
+    return float(calib["table_z"])
+
+
 def pixel_to_base(u: float, v: float, calib: dict) -> tuple[float, float, float]:
     """Overhead pixel -> (x, y, z) on the table surface, metres, arm base frame."""
     H = np.array(calib["homography"], dtype=float)
     p = H @ np.array([u, v, 1.0])
-    return float(p[0] / p[2]), float(p[1] / p[2]), float(calib["table_z"])
+    x, y = float(p[0] / p[2]), float(p[1] / p[2])
+    return x, y, table_z_at(x, y, calib)
 
 
 def pixel_dir_to_base(u: float, v: float, yaw_px_deg: float, calib: dict) -> float:
