@@ -86,6 +86,12 @@ class Arm:
         if clear is not None and np.max(np.abs(self.joints() - load_home())) < 15:
             self.move(clear, gripper=gripper)
 
+    def go_clear(self, gripper: float | None = None) -> None:
+        """Step back to the clear pose (near home, wrist up): out of the tool area, quicker than
+        folding all the way home. Falls back to home if no clear pose was saved."""
+        clear = load_clear()
+        self.move(clear if clear is not None else load_home(), gripper=gripper)
+
     def go_home(self, gripper: float | None = None) -> None:
         """Return home via the clear pose (wrist lifted), then fold down."""
         clear, home = load_clear(), load_home()

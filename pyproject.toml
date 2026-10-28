@@ -14,6 +14,8 @@ dependencies = [
     "meta-sam-parser",
     "numpy",
     "placo",
+    "httpx",
+    "sounddevice",  # microphone (needs the system package libportaudio2)
     # OpenCV: the LeRobot env already ships opencv-python-headless; install one yourself otherwise.
 ]
 
@@ -25,6 +27,8 @@ robot = ["lerobot[feetech]"]
 sag-segment = "say_and_grasp.cli.segment:main"
 sag-calibrate = "say_and_grasp.cli.calibrate:main"
 sag-pick = "say_and_grasp.cli.pick:main"
+sag-agent = "say_and_grasp.cli.agent:main"
+sag-spots = "say_and_grasp.spots:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

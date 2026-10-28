@@ -11,6 +11,7 @@ inside the area they cover and gets worse outside it.
     sag-calibrate --camera 5 --marker "blue block"
     sag-calibrate --refit --drop 7,8      # re-solve from saved points, leaving out bad ones
     sag-calibrate --tcp                   # measure your gripper's grasp centre (do this FIRST)
+    sag-calibrate --refit --marker-height 10   # touched the TOP of a 10 mm block? correct the table height
 
 Torque is switched OFF so you can move the arm by hand. It sags when you let go, so keep
 a hand on it.
@@ -115,6 +116,9 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--camera", help="overhead camera index (e.g. 5) or /dev/v4l/by-id/... path")
     ap.add_argument("--marker", default="coin", help='SAM prompt for your marker, e.g. "coin", "bottle cap"')
+    ap.add_argument("--marker-height", type=float, default=None,
+                    help="height of the marker in mm, if you touch its TOP (e.g. 10 for a LEGO brick); "
+                         "subtracted so the table height is the real table")
     ap.add_argument("--port", default="/dev/ttyACM0", help="follower arm serial port")
     ap.add_argument("--robot-id", default="my_follower")
     ap.add_argument("--points", type=int, default=8, help="number of touch points (min 4, 8 recommended)")
@@ -137,8 +141,9 @@ def main() -> None:
         if len(pts) < 4:
             sys.exit("Need at least 4 points left.")
         print(f"Refitting with {len(pts)} points (dropped {sorted(drop) or 'none'}).")
+        mh = args.marker_height if args.marker_height is not None else old.get("marker_height_mm", 0.0)
         solve_and_save([p["pixel"] for p in pts], [p["base_xyz"] for p in pts], [p["tilt_deg"] for p in pts],
-                       old["camera"], old["image_size"], old["urdf"], args.out)
+                       old["camera"], old["image_size"], old["urdf"], args.out, marker_height_mm=mh)
         # keep the full original set so point numbers stay stable across refits
         new = load_calib(args.out)
         new["all_points"] = old.get("all_points", old["points"])
@@ -205,22 +210,27 @@ def main() -> None:
     finally:
         arm.disconnect()
 
-    solve_and_save(pixels, points, tilts, args.camera, image_size, args.urdf, args.out)
+    solve_and_save(pixels, points, tilts, args.camera, image_size, args.urdf, args.out,
+                   marker_height_mm=args.marker_height or 0.0)
 
 
-def solve_and_save(pixels, points, tilts, camera, image_size, urdf, out) -> None:
+def solve_and_save(pixels, points, tilts, camera, image_size, urdf, out, marker_height_mm: float = 0.0) -> None:
     pixels_a = np.array(pixels, dtype=float)
-    points_a = np.array(points, dtype=float)
+    points_a = np.array(points, dtype=float)  # raw touches, saved as-is
+    surf = points_a.copy()
+    surf[:, 2] -= marker_height_mm / 1000  # touched the marker's top -> the table is this much lower
+    if marker_height_mm:
+        print(f"Correcting for a {marker_height_mm:.0f} mm tall marker (touched on top).")
     H, fit_err, loo_err = fit_homography(pixels_a, points_a[:, :2])
-    table_z = float(np.median(points_a[:, 2]))
+    table_z = float(np.median(surf[:, 2]))
 
     print("\nPoint   pixel        base x,y (mm)      fit err   leave-one-out err")
     for k, ((u, v), p, e, l) in enumerate(zip(pixels_a, points_a, fit_err, loo_err)):
         loo = f"{l*1000:5.1f} mm" if not np.isnan(l) else "   n/a"
         print(f"{k+1:>4}   ({u:4.0f},{v:4.0f})   ({p[0]*1000:6.0f},{p[1]*1000:6.0f})   {e*1000:5.1f} mm   {loo}")
     z_spread = (points_a[:, 2].max() - points_a[:, 2].min()) * 1000
-    plane = fit_table_plane(points_a)
-    plane_res = points_a[:, 2] - (np.c_[points_a[:, :2], np.ones(len(points_a))] @ plane)
+    plane = fit_table_plane(surf)
+    plane_res = surf[:, 2] - (np.c_[surf[:, :2], np.ones(len(surf))] @ plane)
     print(f"\nTable height z = {table_z*1000:.0f} mm (spread {z_spread:.0f} mm across touches)")
     print(f"Table plane: tilts {plane[0]*100:+.1f} mm per 10 cm in x, {plane[1]*100:+.1f} mm per 10 cm in y; "
           f"touches within {np.abs(plane_res).max()*1000:.1f} mm of it")
@@ -236,6 +246,7 @@ def solve_and_save(pixels, points, tilts, camera, image_size, urdf, out) -> None
             "homography": H.tolist(),
             "table_z": table_z,
             "table_plane": plane.tolist(),
+            "marker_height_mm": marker_height_mm,
             "camera": str(camera),
             "image_size": image_size,
             "urdf": urdf,
