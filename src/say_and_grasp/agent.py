@@ -30,14 +30,21 @@ Tools move a real arm, so:
 - Name objects for the vision model with a SHORT concrete phrase: colour + noun when it helps,
   e.g. "side cutters", "red screwdriver", "blue block", "solder spool". Never pass a description
   of purpose ("thing for cutting wire") to a tool; map it to the object you see in the photo.
-- To give the user something: pick_up(object) then hand_over(). To tidy: put_back() after use, or
-  put_down(spot).
+- To give the user something, call fetch(object): it picks it up and hands it over in one go.
+  Use pick_up/hand_over/put_down/put_back only for other jobs (tidying, moving things around).
 - If the object isn't on the bench or out of reach, say so; don't guess.
 - One thing at a time; you can only hold one object.
 
 Reply in ONE short, friendly spoken sentence (no lists, no markdown). Don't narrate tool calls."""
 
 TOOLS = [
+    {"type": "function", "function": {
+        "name": "fetch",
+        "description": "Pick up an object and hand it to the user (put it down at the handover spot), "
+                       "then fold out of the way. The normal way to answer 'pass me / give me X'.",
+        "parameters": {"type": "object", "properties": {
+            "object": {"type": "string", "description": "short noun phrase, e.g. 'side cutters'"}},
+            "required": ["object"]}}},
     {"type": "function", "function": {
         "name": "find",
         "description": "Look for an object on the bench with the overhead camera. Returns whether it was found, "
@@ -84,10 +91,11 @@ def _jpeg_data_url(img: np.ndarray, max_side: int = 640) -> str:
 class Assistant:
     bench: Bench
     model: str = MODEL
-    reasoning_effort: str = "low"
+    reasoning_effort: str = "minimal"
     history: list[dict] = field(default_factory=list)
     max_steps: int = 8
     log: callable = print
+    say: callable = None  # speak a short line straight away (e.g. "On it") while the arm works
 
     # ------------------------------------------------------------------ tools
     def _tool(self, name: str, args: dict) -> dict:
@@ -97,6 +105,12 @@ class Assistant:
                 s = b.look(args["object"])
                 return {"found": True, "position_cm": [round(s.x * 100, 1), round(s.y * 100, 1)],
                         "reachable": 0.16 <= s.reach <= 0.28}
+            if name == "fetch":
+                s = b.pick(args["object"])
+                x, y = spot_xy("handover", b.calib)
+                b.place_xy(x, y)
+                b.go_home()
+                return {"ok": True, "handed_over": s.prompt}
             if name == "pick_up":
                 s = b.pick(args["object"])
                 return {"ok": True, "holding": s.prompt}
@@ -147,12 +161,22 @@ class Assistant:
                 break
             messages.append({"role": "assistant", "content": msg.content or "",
                              "tool_calls": [tc.model_dump() for tc in msg.tool_calls]})
+            # Muse Spark often says what it's about to do alongside the tool call ("I'll grab the
+            # blue block"). Say that NOW, as the arm starts moving, not after it's finished.
+            if msg.content and msg.content.strip() and self.say:
+                self.say(msg.content.strip())
+            results = []
             for tc in msg.tool_calls:
                 args = json.loads(tc.function.arguments or "{}")
                 self.log(f"  [tool] {tc.function.name}({', '.join(f'{k}={v!r}' for k, v in args.items())})")
                 result = self._tool(tc.function.name, args)
                 self.log(f"         -> {result}")
+                results.append((tc.function.name, args, result))
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps(result)})
+            # A successful fetch is the whole job: answer right away instead of a second model call.
+            if len(results) == 1 and results[0][0] == "fetch" and results[0][2].get("ok"):
+                reply = f"Here you go, your {results[0][1]['object']}."
+                break
         else:
             reply = "Sorry, that took too many steps; I've stopped."
         self.history += [{"role": "user", "content": text}, {"role": "assistant", "content": reply}]

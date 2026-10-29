@@ -47,24 +47,34 @@ def listen(prompt: str = "Press Enter and speak; Enter again when done... ") -> 
 
 
 def transcribe(wav: bytes, keywords: list[str] | None = None) -> str:
-    """Send a WAV to Muse Voice Transcribe and return the transcript."""
+    """Send a WAV to Muse Voice Transcribe (file endpoint) and return the transcript.
+
+    The file endpoint takes audioEncoding "WAV"; keywords/PUSH_TO_TALK only exist on the realtime
+    WebSocket, so `keywords` is accepted here but not sent.
+    """
     import httpx
 
-    settings = {"model": ASR_MODEL, "audioEncoding": "PCM_16KHZ", "mode": "PUSH_TO_TALK"}
-    if keywords:
-        settings["keywords"] = keywords  # bias towards tool names it might mishear
-    r = httpx.post(
-        ASR_URL,
-        headers={"Authorization": f"Bearer {os.environ['META_API_KEY']}", "Accept": "application/json"},
-        files={
-            "request": (None, json.dumps(settings), "application/json"),
-            "audio": ("speech.wav", wav, "audio/wav"),
-        },
-        timeout=60,
-    )
-    if r.status_code >= 400:
-        raise RuntimeError(f"Transcription failed ({r.status_code}): {r.text[:300]}")
-    return (r.json().get("transcript") or "").strip()
+    attempts = [
+        {"model": ASR_MODEL, "audioEncoding": "WAV", "mode": "ENDPOINTING"},
+        {"model": ASR_MODEL, "audioEncoding": "WAV"},
+    ]
+    last = None
+    for settings in attempts:
+        r = httpx.post(
+            ASR_URL,
+            headers={"Authorization": f"Bearer {os.environ['META_API_KEY']}", "Accept": "application/json"},
+            files={
+                "request": ("request.json", json.dumps(settings), "application/json"),
+                "audio": ("speech.wav", wav, "audio/wav"),
+            },
+            timeout=60,
+        )
+        if r.status_code < 400:
+            return (r.json().get("transcript") or "").strip()
+        last = f"({r.status_code}) {r.text[:300]} [settings {settings}]"
+        if r.status_code != 400:
+            break
+    raise RuntimeError(f"Transcription failed {last}")
 
 
 _tts = shutil.which("espeak-ng") or shutil.which("espeak") or shutil.which("spd-say")
@@ -74,3 +84,10 @@ def speak(text: str) -> None:
     print(f"\n  🤖 {text}\n", flush=True)
     if _tts:
         subprocess.Popen([_tts, text], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+if __name__ == "__main__":
+    # Quick mic test: python -m say_and_grasp.voice
+    wav = listen()
+    print(f"recorded {len(wav) / (2 * RATE):.1f} s")
+    print("transcript:", repr(transcribe(wav)))

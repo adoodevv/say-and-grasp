@@ -11,6 +11,7 @@ inside the area they cover and gets worse outside it.
     sag-calibrate --camera 5 --marker "blue block"
     sag-calibrate --refit --drop 7,8      # re-solve from saved points, leaving out bad ones
     sag-calibrate --tcp                   # measure your gripper's grasp centre (do this FIRST)
+    sag-calibrate --wrist --wrist-camera 2 --marker "blue block"   # wrist-camera alignment (last)
     sag-calibrate --refit --marker-height 10   # touched the TOP of a 10 mm block? correct the table height
 
 Torque is switched OFF so you can move the arm by hand. It sags when you let go, so keep
@@ -31,7 +32,7 @@ from ..arm import Arm
 from ..calibration import fit_homography, fit_table_plane, load_calib, save_calib
 from ..camera import capture
 from ..kinematics import Kinematics, solve_tcp_offset
-from ..paths import CALIB_FILE, TOOL_FILE, URDF_FILE, output
+from ..paths import CALIB_FILE, TOOL_FILE, URDF_FILE, WRIST_FILE, output
 from ..sam import draw_overlay, grasp_from_mask, segment_robust
 
 
@@ -112,6 +113,110 @@ def measure_tcp(args) -> None:
     print(f"Saved {TOOL_FILE}. Now redo the camera calibration: sag-calibrate --camera N --marker \"blue block\"")
 
 
+def calibrate_wrist(args) -> None:
+    """Learn where a centred object appears in the wrist camera, and how pixels map to millimetres."""
+    import json
+
+    from ..skills import Bench
+
+    if not args.wrist_camera:
+        sys.exit("--wrist-camera is required (e.g. 2, or a /dev/v4l/by-id/... path)")
+    bench = Bench(port=args.port, robot_id=args.robot_id, camera=args.camera)
+    bench.wrist = None  # don't align while calibrating the aligner
+    cam, prompt = args.wrist_camera, args.marker
+
+    last_yaw = {}
+
+    def wrist_centroid(near: np.ndarray | None, tag: str) -> np.ndarray:
+        while True:
+            img = capture(cam, args.mjpg)
+            dets, _ = segment_robust(img, prompt)
+            gs = [grasp_from_mask(d.mask) for d in dets] if dets else []
+            gs = [g for g in gs if g]
+            path = output(f"wrist_calib_{tag}.png")
+            cv2.imwrite(str(path), draw_overlay(img, dets, [grasp_from_mask(d.mask) for d in dets]) if dets else img)
+            if gs:
+                ref = near if near is not None else np.array([img.shape[1] / 2, img.shape[0] / 2])
+                g = min(gs, key=lambda g: np.hypot(g.u - ref[0], g.v - ref[1]))
+                last_yaw[tag] = g.yaw_deg
+                print(f"    wrist camera sees it at pixel ({g.u:.0f}, {g.v:.0f}), angle {g.yaw_deg:.0f} deg  [{path.name}]")
+                return np.array([g.u, g.v])
+            input(f"    SAM can't see '{prompt}' in the wrist camera ({path}). Fix the view, then Enter... ")
+
+    try:
+        bench.connect()
+        seen = bench.look(prompt)
+        above = bench._solve("above object", seen.x, seen.y, seen.z + bench.hov, seen.close_dir)
+        arm = bench.arm
+        arm.leave_home()
+        arm.move(above, gripper=bench.g_open)
+        print("\nThe arm is hovering over the block with the jaws open.")
+        input("Look from the side and nudge the BLOCK (not the arm) until it sits centred between the jaws\n"
+              "AND square to them (long side parallel to the jaw faces). Enter... ")
+        p0 = wrist_centroid(None, "centre")
+
+        R2 = bench.tool_xy_axes(above)
+        step = 0.015
+        cols = []
+        for k, axis in enumerate(("x", "y")):
+            d_tool = np.zeros(2)
+            d_tool[k] = step
+            dx, dy = R2 @ d_tool
+            q = bench._solve(f"shift {axis}", seen.x + dx, seen.y + dy, seen.z + bench.hov, seen.close_dir)
+            arm.move(q)
+            time.sleep(0.3)
+            p = wrist_centroid(p0, f"shift_{axis}")
+            cols.append((p - p0) / step)
+            arm.move(above)
+        A = np.column_stack(cols)  # pixel shift per metre of gripper motion along tool x / y
+        scale = np.sqrt(abs(np.linalg.det(A))) / 1000
+        print(f"\nWrist camera: {scale:.1f} px per mm of gripper motion")
+        if scale < 1:
+            print("  ! very small: the block barely moved in the image. Is the wrist camera index right?")
+
+        # Check: move to a known offset and see if the alignment math recovers it.
+        test = np.array([0.008, -0.006])
+        dx, dy = R2 @ test
+        q = bench._solve("check", seen.x + dx, seen.y + dy, seen.z + bench.hov, seen.close_dir)
+        arm.move(q)
+        time.sleep(0.3)
+        p = wrist_centroid(p0, "check")
+        est = np.linalg.solve(A, p - p0)  # A maps gripper motion -> pixel shift, so invert it
+        err = np.hypot(*(est - test)) * 1000
+        print(f"Check: moved {test*1000} mm, wrist camera says {np.round(est*1000, 1)} mm -> error {err:.1f} mm "
+              + ("(good)" if err < 3 else "(rough: redo with the block better centred)"))
+
+        # Angle: turn the wrist 20 deg and see how the block's angle changes in the image.
+        arm.move(above)
+        q = bench._solve("turn", seen.x, seen.y, seen.z + bench.hov, seen.close_dir + 20.0)
+        arm.move(q)
+        time.sleep(0.3)
+        wrist_centroid(p0, "turn")
+        from ..skills import _wrap90
+        yaw_gain = _wrap90(last_yaw["turn"] - last_yaw["centre"]) / 20.0
+        print(f"Angle: turning the gripper 20 deg turned the block {yaw_gain * 20:+.0f} deg in the image")
+        if not 0.5 < abs(yaw_gain) < 1.5:
+            print("  ! expected about +/-20 deg; the block may be too square or SAM's mask was off. "
+                  "Angle correction will be skipped.")
+        arm.move(above)
+
+        WRIST_FILE.parent.mkdir(parents=True, exist_ok=True)
+        WRIST_FILE.write_text(json.dumps({
+            "camera": str(cam),
+            "target_px": p0.round(1).tolist(),
+            "px_per_m": (-A).round(1).tolist(),  # sign: object offset (not gripper motion) -> pixel error
+            **({"target_yaw_px": round(float(last_yaw["centre"]), 1), "yaw_gain": round(float(yaw_gain), 3)}
+               if 0.5 < abs(yaw_gain) < 1.5 else {}),
+            "hover_mm": bench.hov * 1000,
+            "check_err_mm": round(float(err), 2),
+            "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }, indent=2))
+        print(f"Saved {WRIST_FILE}. Picks now centre the gripper with the wrist camera before descending.")
+        bench.go_home()
+    finally:
+        bench.close()
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--camera", help="overhead camera index (e.g. 5) or /dev/v4l/by-id/... path")
@@ -128,10 +233,15 @@ def main() -> None:
     ap.add_argument("--refit", action="store_true", help="re-solve from the points saved in --out")
     ap.add_argument("--drop", default="", help="with --refit: point numbers to leave out, e.g. 7,8")
     ap.add_argument("--tcp", action="store_true", help="measure the gripper's grasp centre (writes config/tool.json)")
+    ap.add_argument("--wrist", action="store_true", help="calibrate wrist-camera alignment (writes config/wrist.json)")
+    ap.add_argument("--wrist-camera", help="wrist camera index or /dev/v4l/by-id path (for --wrist)")
     args = ap.parse_args()
 
     if args.tcp:
         measure_tcp(args)
+        return
+    if args.wrist:
+        calibrate_wrist(args)
         return
 
     if args.refit:

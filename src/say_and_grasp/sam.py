@@ -43,15 +43,23 @@ class GraspTarget:
     width_px: float  # object extent along the closing direction (sanity check vs. jaw opening)
 
 
-def _encode_image(img_bgr: np.ndarray) -> tuple[str, float]:
+_use_jpeg = True  # ~7x smaller uploads than PNG; falls back to PNG if the API ever rejects it
+
+
+def _encode_image(img_bgr: np.ndarray, max_side: int = MAX_SIDE, jpeg: bool = True) -> tuple[str, float]:
     h, w = img_bgr.shape[:2]
-    scale = min(1.0, MAX_SIDE / max(h, w))
+    scale = min(1.0, max_side / max(h, w))
     if scale < 1.0:
         img_bgr = cv2.resize(img_bgr, (round(w * scale), round(h * scale)), interpolation=cv2.INTER_AREA)
-    ok, buf = cv2.imencode(".png", img_bgr)
+    if jpeg:
+        ok, buf = cv2.imencode(".jpg", img_bgr, [cv2.IMWRITE_JPEG_QUALITY, 88])
+        mime = "image/jpeg"
+    else:
+        ok, buf = cv2.imencode(".png", img_bgr)
+        mime = "image/png"
     if not ok:
         raise RuntimeError("Could not encode image")
-    return "data:image/png;base64," + base64.b64encode(buf.tobytes()).decode(), scale
+    return f"data:{mime};base64," + base64.b64encode(buf.tobytes()).decode(), scale
 
 
 def parse_output(output_text: str, sent_shape: tuple[int, int], orig_shape: tuple[int, int]) -> list[Detection]:
@@ -113,27 +121,34 @@ def get_client():
     return _client
 
 
-def segment(img_bgr: np.ndarray, prompt: str, client=None) -> list[Detection]:
-    """Segment every instance of `prompt` in a BGR image. Returns [] when nothing matches."""
+def segment(img_bgr: np.ndarray, prompt: str, client=None, max_side: int = MAX_SIDE) -> list[Detection]:
+    """Segment every instance of `prompt` in a BGR image. Returns [] when nothing matches.
+    Detections come back in the ORIGINAL image's pixel coordinates, whatever max_side is."""
+    global _use_jpeg
     client = client or get_client()
-    data_url, scale = _encode_image(img_bgr)
     oh, ow = img_bgr.shape[:2]
-    sent_shape = (round(oh * scale), round(ow * scale)) if scale < 1.0 else (oh, ow)
+
+    def call(jpeg: bool):
+        data_url, scale = _encode_image(img_bgr, max_side, jpeg)
+        resp = client.responses.create(
+            model=MODEL,
+            input=[{"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": prompt},
+                {"type": "input_image", "image_url": data_url},
+            ]}],
+        )
+        return resp, scale
 
     t0 = time.time()
-    resp = client.responses.create(
-        model=MODEL,
-        input=[
-            {
-                "type": "message",
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": prompt},
-                    {"type": "input_image", "image_url": data_url},
-                ],
-            }
-        ],
-    )
+    try:
+        resp, scale = call(_use_jpeg)
+    except Exception as e:  # e.g. the API refusing JPEG: switch to PNG for the rest of the session
+        if not _use_jpeg:
+            raise
+        print(f"[sam] JPEG upload failed ({e.__class__.__name__}); using PNG from now on", file=sys.stderr)
+        _use_jpeg = False
+        resp, scale = call(False)
+    sent_shape = (round(oh * scale), round(ow * scale)) if scale < 1.0 else (oh, ow)
     text = resp.output_text or ""
     print(f"[sam] '{prompt}': {time.time() - t0:.2f}s round trip, {len(text)} chars", file=sys.stderr)
     if not text.strip():
@@ -164,10 +179,10 @@ def prompt_variants(prompt: str) -> list[str]:
     return out
 
 
-def segment_robust(img_bgr: np.ndarray, prompt: str) -> tuple[list[Detection], str]:
+def segment_robust(img_bgr: np.ndarray, prompt: str, max_side: int = MAX_SIDE) -> tuple[list[Detection], str]:
     """segment() with automatic prompt fallbacks. Returns (detections, the prompt that worked)."""
     for p in prompt_variants(prompt):
-        dets = segment(img_bgr, p)
+        dets = segment(img_bgr, p, max_side=max_side)
         if dets:
             if p != prompt:
                 print(f"[sam] '{prompt}' found nothing; '{p}' worked", file=sys.stderr)

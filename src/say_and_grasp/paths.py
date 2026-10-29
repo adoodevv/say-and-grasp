@@ -10,6 +10,7 @@ CALIB_FILE = CONFIG_DIR / "calib.json"
 HOME_FILE = CONFIG_DIR / "home.json"
 CLEAR_FILE = CONFIG_DIR / "clear.json"  # home with the wrist lifted clear of the base
 TOOL_FILE = CONFIG_DIR / "tool.json"  # grasp-centre (TCP) offset of the gripper
+WRIST_FILE = CONFIG_DIR / "wrist.json"  # wrist camera: where a centred object appears + px/mm
 URDF_FILE = ASSETS_DIR / "SO101" / "so101_new_calib.urdf"
 
 

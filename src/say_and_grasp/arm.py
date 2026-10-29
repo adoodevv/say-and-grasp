@@ -15,7 +15,7 @@ DEFAULT_HOME = [0.0, -100.0, 95.0, 70.0, 0.0]  # folded, roughly LeRobot's rest 
 class Arm:
     """Thin wrapper over LeRobot's SO101Follower with smooth, rate-limited joint moves."""
 
-    def __init__(self, port: str, robot_id: str = "my_follower", speed_dps: float = 30.0):
+    def __init__(self, port: str, robot_id: str = "my_follower", speed_dps: float = 45.0):
         from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
 
         import logging
@@ -30,8 +30,26 @@ class Arm:
         self.q_cmd: np.ndarray | None = None  # last COMMANDED arm joints (not the sagged reading)
         self.corr = np.zeros(len(ARM_JOINTS))  # learned gravity-sag compensation, degrees
 
-    def connect(self) -> None:
-        self.robot.connect(calibrate=False)
+    def connect(self, attempts: int = 3) -> None:
+        # The Feetech bus sometimes returns a garbled status packet right after power-up or a
+        # replug ("Incorrect status packet"); a clean retry nearly always works.
+        for i in range(attempts):
+            try:
+                self.robot.connect(calibrate=False)
+                break
+            except ConnectionError as e:
+                if i == attempts - 1:
+                    raise ConnectionError(
+                        f"{e}\nArm bus keeps failing. Check: arm power supply on; arm USB adapter plugged "
+                        "straight into the laptop (not a shared hub); motor cables seated; port "
+                        "(lerobot-find-port)."
+                    ) from None
+                print(f"[arm] bus glitch on connect ({e.__class__.__name__}); retrying {i + 2}/{attempts}...")
+                try:
+                    self.robot.bus.disconnect(disable_torque=False)
+                except Exception:
+                    pass
+                time.sleep(1.0)
         obs = self.robot.get_observation()
         self.gripper = float(obs["gripper.pos"])
         self.q_cmd = self.joints()
@@ -84,25 +102,24 @@ class Arm:
         """If we're at home, first lift the wrist to the clear pose so nothing scrapes the base."""
         clear = load_clear()
         if clear is not None and np.max(np.abs(self.joints() - load_home())) < 15:
-            self.move(clear, gripper=gripper)
+            self.move(clear, gripper=gripper, settle_s=0.1)  # pass-through point
 
     def go_clear(self, gripper: float | None = None) -> None:
         """Step back to the clear pose (near home, wrist up): out of the tool area, quicker than
         folding all the way home. Falls back to home if no clear pose was saved."""
         clear = load_clear()
-        self.move(clear if clear is not None else load_home(), gripper=gripper)
+        self.move(clear if clear is not None else load_home(), gripper=gripper, settle_s=0.3)
 
     def go_home(self, gripper: float | None = None) -> None:
         """Return home via the clear pose (wrist lifted), then fold down."""
         clear, home = load_clear(), load_home()
         if clear is not None and np.max(np.abs(self.joints() - home)) >= 15:  # skip if already home
-            self.move(clear, gripper=gripper)
-        self.move(home, gripper=gripper)
+            self.move(clear, gripper=gripper, settle_s=0.1)
+        self.move(home, gripper=gripper, settle_s=0.3)
 
-    def set_gripper(self, value: float, seconds: float = 0.8) -> None:
+    def set_gripper(self, value: float) -> None:
         """Open/close in place: holds the last commanded arm pose, so the arm doesn't sink."""
-        self.move(self.q_cmd if self.q_cmd is not None else self.joints(), gripper=value)
-        time.sleep(seconds * 0.3)
+        self.move(self.q_cmd if self.q_cmd is not None else self.joints(), gripper=value, settle_s=0.35)
 
 
 def load_home() -> np.ndarray:

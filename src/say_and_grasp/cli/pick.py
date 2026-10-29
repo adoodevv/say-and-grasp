@@ -50,7 +50,7 @@ def main() -> None:
     ap.add_argument("--open", type=float, default=60, help="gripper value when open (0-100)")
     ap.add_argument("--closed", type=float, default=5, help="gripper value when closed (0-100)")
     ap.add_argument("--yaw-offset", type=float, default=0, help="degrees added to the grasp angle")
-    ap.add_argument("--speed", type=float, default=30, help="joint speed, deg/s")
+    ap.add_argument("--speed", type=float, default=45, help="joint speed, deg/s")
     ap.add_argument("--pause", action="store_true",
                     help="stop just above the object so you can check the jaw angle before grasping")
     ap.add_argument("--retries", type=int, default=2, help="re-look and retry this many times after a missed grasp")
