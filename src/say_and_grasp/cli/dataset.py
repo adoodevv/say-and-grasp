@@ -46,11 +46,29 @@ def main() -> None:
             print(f"    #{l['episode_index']} {l.get('object','?')}: {l.get('verifier') or l.get('error')}")
 
     if args.push:
-        from lerobot.datasets.lerobot_dataset import LeRobotDataset
+        push(args.repo_id, private=args.private)
 
-        ds = LeRobotDataset(args.repo_id, root=root)
-        ds.push_to_hub(private=args.private, tags=["say-and-grasp", "so101", "zero-shot", "meta-hackathon"])
-        print(f"Pushed to https://huggingface.co/datasets/{args.repo_id}")
+
+def push(repo_id: str = DEFAULT_REPO_ID, private: bool = False) -> None:
+    """Upload the dataset (videos, data, metadata and Muse Spark's labels.jsonl) to the Hub."""
+    from huggingface_hub import whoami
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    try:
+        user = whoami()["name"]
+    except Exception:
+        print("Not logged in to Hugging Face. Run: huggingface-cli login   (or: hf auth login)")
+        return
+    if repo_id.split("/")[0] != user:
+        print(f"Note: you're logged in as '{user}', pushing to '{repo_id}'.")
+    root = dataset_root(repo_id)
+    if not (root / "meta" / "info.json").exists():
+        print(f"No dataset at {root} yet.")
+        return
+    print(f"Pushing {root} to the Hub...")
+    ds = LeRobotDataset(repo_id, root=root)
+    ds.push_to_hub(private=private, tags=["say-and-grasp", "so101", "zero-shot", "meta-hackathon", "muse-spark", "sam3"])
+    print(f"Done: https://huggingface.co/datasets/{repo_id}")
 
 
 if __name__ == "__main__":

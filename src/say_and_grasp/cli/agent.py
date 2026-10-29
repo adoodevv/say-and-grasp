@@ -4,6 +4,7 @@
     sag-agent --text          # type requests instead (no microphone needed)
     sag-agent --text --dry-run   # plan only, the arm doesn't move
     sag-agent --no-record        # don't save episodes to the dataset
+    sag-agent --push             # upload the dataset to the Hugging Face Hub when you quit
 
 Every fetch is recorded as a LeRobot episode in data/ and labelled by Muse Spark (sag-dataset).
 
@@ -32,6 +33,8 @@ def main() -> None:
     ap.add_argument("--no-record", action="store_true", help="don't record episodes")
     ap.add_argument("--no-verify", action="store_true", help="skip Muse Spark's check after each handover")
     ap.add_argument("--repo-id", default=None, help="dataset id (default adoodevv/say-and-grasp-handovers)")
+    ap.add_argument("--push", action="store_true", help="push the dataset to the Hugging Face Hub on exit")
+    ap.add_argument("--private", action="store_true", help="with --push: make the Hub dataset private")
     args = ap.parse_args()
 
     record = not args.no_record and not args.dry_run
@@ -43,8 +46,14 @@ def main() -> None:
     if record:
         from ..recorder import DEFAULT_REPO_ID, EpisodeRecorder
 
+        prompt = "you> " if args.text else "Enter to talk... "
+
+        def bg_log(msg: str) -> None:
+            # Background saves finish while you're at the prompt: print above it, then redraw it.
+            print(f"\r\033[K{msg}\n{prompt}", end="", flush=True)
+
         recorder = EpisodeRecorder(bench.arm, bench.overhead_peek, bench.wrist_peek,
-                                   repo_id=args.repo_id or DEFAULT_REPO_ID)
+                                   repo_id=args.repo_id or DEFAULT_REPO_ID, log=bg_log)
         print(f"Recording episodes to {recorder.root}")
     bot = Assistant(bench, reasoning_effort=args.effort, say=speak, recorder=recorder,
                     verify=not args.no_verify)
@@ -65,8 +74,13 @@ def main() -> None:
     finally:
         bench.go_home()
         if recorder:
+            print("Finishing the last episode...")
             recorder.close()
         bench.close()
+        if recorder and args.push:
+            from .dataset import push
+
+            push(args.repo_id or DEFAULT_REPO_ID, private=args.private)
 
 
 if __name__ == "__main__":
