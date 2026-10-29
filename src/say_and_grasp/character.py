@@ -1,6 +1,6 @@
-"""Kojo's character: a name to answer to, a wake-up and a bedtime, and a few gestures.
+"""Wiggle's character: a name to answer to, a wake-up and a bedtime, and a few gestures.
 
-Kojo sleeps folded at home. Call its name and it wakes up: a sleepy twitch, a stretch and a
+Wiggle sleeps folded at home. Call its name and it wakes up: a sleepy twitch, a stretch and a
 yawn (gripper wide open), a look around, and a happy double chirp of the gripper. While awake it
 sits in its "awake" pose, looking at you, and goes back to sleep after a while with nothing to do.
 
@@ -13,7 +13,7 @@ The gripper is its mouth and the wrist is its head:
     wake/sleep  the animations above
 
 Gestures are small oscillations around the awake pose (signs don't matter, so they work on any
-SO-101 calibration). The awake pose itself is saved by hand: sag-kojo --save-awake.
+SO-101 calibration). The awake pose itself is saved by hand: sag-wiggle --save-awake.
 """
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ import numpy as np
 from .arm import load_clear, load_home
 from .paths import CONFIG_DIR
 
-NAME = "Kojo"
+NAME = "Wiggle"
 AWAKE_FILE = CONFIG_DIR / "awake.json"
 GESTURES = ["wave", "nod", "shake_head", "tilt_head", "dance", "wake", "sleep"]
 
@@ -36,7 +36,8 @@ PAN, LIFT, ELBOW, WFLEX, ROLL = range(5)
 MOUTH_REST = 20.0  # gripper opening while awake
 
 # How the name may come back from speech-to-text.
-_NAME = r"(?:kojo|kodjo|cojo|codjo|ko\s?jo|kojoe|kojoh|kojue|koujo|cojoe|kojo'?s)"
+# How the name may come back from speech-to-text: Wiggle, Wiggles, Wiggy, Wigle, Wiggel...
+_NAME = r"(?:wig{1,2}(?:le|les|el|al|ly|y|gle)|wriggle|wiggle)"
 _CALL = re.compile(rf"\b(?:(?:hey|hi|hello|yo|ok|okay)[\s,]+)?{_NAME}\b[\s,.!?]*", re.I)
 _JUST_CALLING = re.compile(
     r"^(?:wake up|are you (?:there|awake|up)|you there|hello|hi|hey|good morning|morning)?\W*$", re.I)
@@ -52,9 +53,9 @@ GOODNIGHTS = ["Okay, nap time. Call me if you need me.", "Alright, I'll be right
 
 
 def heard_name(text: str) -> tuple[bool, str]:
-    """Was Kojo called? Returns (called, what's left of the request).
+    """Was Wiggle called? Returns (called, what's left of the request).
 
-    "Kojo, pass me the pliers" -> (True, "pass me the pliers"); "hey kojo!" -> (True, "")."""
+    "Wiggle, pass me the pliers" -> (True, "pass me the pliers"); "hey wiggle!" -> (True, "")."""
     if not _CALL.search(text):
         return False, text.strip()
     rest = _CALL.sub(" ", text).strip(" ,.!?")
@@ -76,7 +77,7 @@ def save_awake(joints: np.ndarray) -> None:
 
 
 class Character:
-    """Kojo's body language on top of a say_and_grasp.skills.Bench."""
+    """Wiggle's body language on top of a say_and_grasp.skills.Bench."""
 
     def __init__(self, bench, say=print, log=print, sleep_after_s: float = 60.0):
         self.bench, self.say, self.log = bench, say, log
@@ -85,7 +86,7 @@ class Character:
         self.sleep_after_s = sleep_after_s
         self.last_active = time.time()
         if not AWAKE_FILE.exists():
-            self.log("[kojo] no awake pose saved; using a default (sag-kojo --save-awake)")
+            self.log("[wiggle] no awake pose saved; using a default (sag-wiggle --save-awake)")
 
     @property
     def arm(self):
@@ -152,7 +153,7 @@ class Character:
             if greet:
                 self.say(random.choice(["Still here!", "Yep, I'm listening.", "What's up?"]))
             return
-        self.log("[kojo] waking up" + (" (quick)" if quick else ""))
+        self.log("[wiggle] waking up" + (" (quick)" if quick else ""))
         a = self.awake_pose
         clear = load_clear()
         if quick:
@@ -189,7 +190,7 @@ class Character:
     def sleep(self, goodnight: bool = True) -> None:
         if not self.awake:
             return
-        self.log("[kojo] going to sleep")
+        self.log("[wiggle] going to sleep")
         if self.bench.holding:
             self.bench.put_back()
         if goodnight:

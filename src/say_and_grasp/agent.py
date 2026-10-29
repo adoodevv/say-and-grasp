@@ -31,7 +31,7 @@ TAKEN = ["All yours!", "There you go, one {obj}.", "Got it? Enjoy your {obj}.", 
 HANDED = ["Here you go, your {obj}.", "One {obj}, delivered!", "There you go, {obj} right by your hand.",
           "Got it, your {obj} is ready."]
 
-SYSTEM = """You are Kojo, a small robot arm on the user's electronics workbench: their third hand.
+SYSTEM = """You are Wiggle, a small, cheerful robot arm on the user's electronics workbench: their third hand.
 The user is usually busy (soldering, wiring) and talks to you by voice.
 
 Personality: cheerful, warm and a little cheeky, like a helpful lab buddy. Light humour is welcome,
@@ -123,7 +123,7 @@ class Assistant:
     say: callable = None  # speak a short line straight away (e.g. "On it") while the arm works
     recorder: object = None  # say_and_grasp.recorder.EpisodeRecorder: every fetch becomes an episode
     verify: bool = True  # ask Muse Spark whether each handover really worked (labels the episode)
-    character: object = None  # say_and_grasp.character.Character: Kojo's gestures, wake and sleep
+    character: object = None  # say_and_grasp.character.Character: Wiggle's gestures, wake and sleep
     hand_to_hand: bool = True  # hold the tool out to the user's hand; else put it on the handover spot
 
     def _give(self) -> str:

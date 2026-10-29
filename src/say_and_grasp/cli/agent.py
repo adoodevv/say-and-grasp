@@ -1,13 +1,13 @@
-"""Talk to Kojo, the workbench assistant.
+"""Talk to Wiggle, the workbench assistant.
 
-    sag-agent --hands-free    # just talk: say "Kojo" to wake it, then ask
+    sag-agent --hands-free    # just talk: say "Wiggle" to wake it, then ask
     sag-agent                 # push-to-talk: Enter, speak, Enter
     sag-agent --text          # type requests instead (no microphone needed)
     sag-agent --text --dry-run   # plan only, the arm doesn't move
     sag-agent --no-record        # don't save episodes to the dataset
     sag-agent --push             # upload the dataset to the Hugging Face Hub when you quit
 
-Kojo sleeps folded up until you call its name ("Kojo!", "hey Kojo, pass me the pliers"), then
+Wiggle sleeps folded up until you call its name ("Wiggle!", "hey Wiggle, pass me the pliers"), then
 wakes up and stays awake, looking at you, until it's been idle a while (--sleep-after) or you say
 goodnight. In hands-free mode it only listens for its name while asleep.
 
@@ -29,8 +29,8 @@ from ..voice import listen, listen_auto, speak, transcribe
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--text", action="store_true", help="type instead of speaking")
-    ap.add_argument("--hands-free", action="store_true", help="no Enter key: say 'Kojo' to wake it")
-    ap.add_argument("--sleep-after", type=float, default=60, help="seconds idle before Kojo naps (hands-free)")
+    ap.add_argument("--hands-free", action="store_true", help="no Enter key: say 'Wiggle' to wake it")
+    ap.add_argument("--sleep-after", type=float, default=60, help="seconds idle before Wiggle naps (hands-free)")
     ap.add_argument("--dry-run", action="store_true", help="don't move the arm")
     ap.add_argument("--port", default="/dev/ttyACM0")
     ap.add_argument("--robot-id", default="my_follower")
@@ -66,11 +66,11 @@ def main() -> None:
         recorder = EpisodeRecorder(bench.arm, bench.overhead_peek, bench.wrist_peek,
                                    repo_id=args.repo_id or DEFAULT_REPO_ID, log=bg_log)
         print(f"Recording episodes to {recorder.root}")
-    kojo = Character(bench, say=speak, sleep_after_s=args.sleep_after)
+    buddy = Character(bench, say=speak, sleep_after_s=args.sleep_after)
     bot = Assistant(bench, reasoning_effort=args.effort, say=speak, recorder=recorder,
-                    verify=not args.no_verify, character=kojo, hand_to_hand=not args.no_hand)
+                    verify=not args.no_verify, character=buddy, hand_to_hand=not args.no_hand)
     hands_free = args.hands_free and not args.text
-    print("Kojo is asleep. Say its name to wake it" + (" (just talk)." if hands_free else ".")
+    print("Wiggle is asleep. Say its name to wake it" + (" (just talk)." if hands_free else ".")
           + " Ctrl+C to quit.")
 
     def hear() -> str | None:
@@ -78,8 +78,8 @@ def main() -> None:
         if args.text:
             return input("\nyou> ").strip()
         if hands_free:
-            timeout = max(1.0, kojo.sleep_after_s - (time.time() - kojo.last_active)) if kojo.awake else None
-            print("\n  [listening" + ("" if kojo.awake else " for 'Kojo'") + "...]", flush=True)
+            timeout = max(1.0, buddy.sleep_after_s - (time.time() - buddy.last_active)) if buddy.awake else None
+            print("\n  [listening" + ("" if buddy.awake else " for 'Wiggle'") + "...]", flush=True)
             wav = listen_auto(timeout=timeout)
             if wav is None:
                 return None
@@ -93,27 +93,27 @@ def main() -> None:
         while True:
             text = hear()
             if text is None:  # idle too long
-                kojo.sleep()
+                buddy.sleep()
                 continue
             if not text:
                 continue
             called, rest = heard_name(text)
-            if not called and hands_free and not kojo.awake:
+            if not called and hands_free and not buddy.awake:
                 continue  # asleep: only its name wakes it
-            if called and not rest:  # "Kojo!" -> wake up (or "still here")
-                kojo.wake()
+            if called and not rest:  # "Wiggle!" -> wake up (or "still here")
+                buddy.wake()
                 continue
-            if called and not kojo.awake:
-                kojo.wake(quick=True, greet=False)  # "Kojo, pass me ..." -> perk up and get on with it
-            kojo.touch()
+            if called and not buddy.awake:
+                buddy.wake(quick=True, greet=False)  # "Wiggle, pass me ..." -> perk up and get on with it
+            buddy.touch()
             speak(bot.handle(rest if called else text))
-            kojo.touch()
+            buddy.touch()
     except (KeyboardInterrupt, EOFError):
         print("\nBye.")
     finally:
-        if kojo.awake:
+        if buddy.awake:
             try:
-                kojo.sleep()
+                buddy.sleep()
             except Exception:
                 pass
         bench.go_home()

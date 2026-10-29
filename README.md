@@ -1,6 +1,6 @@
 # Say-and-Grasp
 
-**A voice-controlled third hand for your workbench.** Say *"Kojo, pass me the side cutters"* and a $250 robot arm finds them, picks them up and drops them into your open hand, using Meta's Muse Spark and SAM 3.1 with **zero task-specific training**. Every handover is also recorded as a training episode and labelled by Muse Spark, so the robot builds its own dataset as it works.
+**A voice-controlled third hand for your workbench.** Say *"Wiggle, pass me the side cutters"* and a $250 robot arm finds them, picks them up and drops them into your open hand, using Meta's Muse Spark and SAM 3.1 with **zero task-specific training**. Every handover is also recorded as a training episode and labelled by Muse Spark, so the robot builds its own dataset as it works.
 
 Built for the **Meta Global AI Developer Hackathon** (Oct 26 – Nov 4, 2026), Indie Developer track.
 
@@ -12,15 +12,15 @@ Anyone who builds hardware knows the moment: you're holding the iron and a wire,
 
 Low-cost robot arms could help, but today they learn one task at a time from dozens of human demonstrations. Say-and-Grasp needs none. It understands the request, finds the tool and grasps it zero-shot. Each successful run then becomes a demonstration, so the arm can later be trained on data it collected itself.
 
-## Meet Kojo
+## Meet Wiggle
 
-The arm is called **Kojo**, the Ghanaian name for a boy born on a Monday, like this project (the hackathon build began on Monday, Oct 26). Kojo naps folded up on the bench until you call its name. Then it wakes up: a sleepy twitch, a stretch with a big yawn (gripper wide open), a look around for you and a happy double snap of the gripper. While awake it sits up facing you, and it nods off again after a minute with nothing to do or when you say goodnight.
+The arm is called **Wiggle**. It naps folded up on the bench until you call its name. Then it wakes up: a sleepy twitch, a stretch with a big yawn (gripper wide open), a look around for you and a happy double snap of the gripper. While awake it sits up facing you, and it nods off again after a minute with nothing to do or when you say goodnight.
 
 Its gripper is its mouth and its wrist is its head, so it can **wave**, **nod**, **shake its head**, **tilt its head** when puzzled (after a missed grab, say) and **dance**. Muse Spark picks a gesture when it fits: ask it to wave, thank it, or tell it the circuit works.
 
 ## How it works
 
-You say *"Kojo, pass me the side cutters"*. **Muse Voice Transcribe** turns it into text, and **Muse Spark** reads the request alongside a fresh photo of the bench. It works out which tool you mean and calls the robot's **`fetch`** tool. **SAM 3.1** finds the tool in the **overhead camera**; its outline gives a grasp point and jaw angle, which the calibration turns into a position on the table. The arm moves above the tool, and **SAM 3.1** looks again through the **wrist camera**. If the jaws are off-centre or not square to the tool, it **corrects and re-checks** until they're lined up. Then it **grasps and checks the grip**. Still holding the tool, it looks for **your open hand** with **SAM 3.1**, moves over it and **drops the tool into your palm**. If no hand is held out, it puts the tool on a handover spot and **Muse Spark checks** that it landed there. Either way, the whole run is saved as a **LeRobot dataset episode** labelled with how it went.
+You say *"Wiggle, pass me the side cutters"*. **Muse Voice Transcribe** turns it into text, and **Muse Spark** reads the request alongside a fresh photo of the bench. It works out which tool you mean and calls the robot's **`fetch`** tool. **SAM 3.1** finds the tool in the **overhead camera**; its outline gives a grasp point and jaw angle, which the calibration turns into a position on the table. The arm moves above the tool, and **SAM 3.1** looks again through the **wrist camera**. If the jaws are off-centre or not square to the tool, it **corrects and re-checks** until they're lined up. Then it **grasps and checks the grip**. Still holding the tool, it looks for **your open hand** with **SAM 3.1**, moves over it and **drops the tool into your palm**. If no hand is held out, it puts the tool on a handover spot and **Muse Spark checks** that it landed there. Either way, the whole run is saved as a **LeRobot dataset episode** labelled with how it went.
 
 | Step | Meta model | What it does |
 |---|---|---|
@@ -91,26 +91,26 @@ sag-pick --save-clear                                # rest pose with the wrist 
 sag-calibrate --wrist --wrist-camera 2 --marker "blue block"   # wrist-camera alignment
 sag-spots set handover 420,280                       # where tools are put down for you (overhead pixel)
 sag-pick --show-reach                                # check the reachable zone (outputs/reach.png)
-sag-kojo --save-awake                                # Kojo's awake pose: sitting up, facing you, out of the camera's view
+sag-wiggle --save-awake                                # Wiggle's awake pose: sitting up, facing you, out of the camera's view
 ```
 
 ## Use
 
 ```bash
-sag-agent --hands-free        # just talk: "Kojo!" wakes it, then "pass me the pliers"
+sag-agent --hands-free        # just talk: "Wiggle!" wakes it, then "pass me the pliers"
 sag-agent                     # push-to-talk: Enter, speak, Enter
 sag-agent --text              # type requests instead
 sag-agent --text --push       # …and upload the dataset to the Hub when you quit
 ```
 
-Lower-level tools: `sag-segment` (run SAM 3.1 on a camera or image), `sag-pick` (pick one named object without the assistant; `--offer` hands it to you), `sag-kojo wake wave dance sleep` (play Kojo's gestures).
+Lower-level tools: `sag-segment` (run SAM 3.1 on a camera or image), `sag-pick` (pick one named object without the assistant; `--offer` hands it to you), `sag-wiggle wake wave dance sleep` (play Wiggle's gestures).
 
 ## Repo layout
 
 ```
 src/say_and_grasp/
-  agent.py         Muse Spark assistant (Kojo's personality): tools, one-call fetch, handover verification
-  character.py     Kojo's wake word, wake-up and sleep animations, gestures
+  agent.py         Muse Spark assistant (Wiggle's personality): tools, one-call fetch, handover verification
+  character.py     Wiggle's wake word, wake-up and sleep animations, gestures
   skills.py        look / pick / place / hand over: wrist-camera alignment, follow, retry, drop into your hand
   sam.py           SAM 3.1 via Meta Model API: prompt → masks → grasp targets
   voice.py         push-to-talk or hands-free listening, Muse Voice Transcribe, spoken replies
@@ -120,7 +120,7 @@ src/say_and_grasp/
   calibration.py   overhead pixel ↔ table mapping, table plane, reach limits
   camera.py        single shots and background camera streams
   spots.py         named bench spots (handover)
-  cli/             sag-agent, sag-pick, sag-kojo, sag-calibrate, sag-segment, sag-dataset
+  cli/             sag-agent, sag-pick, sag-wiggle, sag-calibrate, sag-segment, sag-dataset
 config/            per-setup calibration (camera, gripper, wrist camera, home pose)
 assets/SO101/      SO-101 URDF + meshes (fetched, not committed)
 data/              recorded episodes (pushed to the Hub, not committed)

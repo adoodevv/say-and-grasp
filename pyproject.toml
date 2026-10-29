@@ -30,7 +30,7 @@ sag-pick = "say_and_grasp.cli.pick:main"
 sag-agent = "say_and_grasp.cli.agent:main"
 sag-spots = "say_and_grasp.spots:main"
 sag-dataset = "say_and_grasp.cli.dataset:main"
-sag-kojo = "say_and_grasp.cli.kojo:main"
+sag-wiggle = "say_and_grasp.cli.wiggle:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

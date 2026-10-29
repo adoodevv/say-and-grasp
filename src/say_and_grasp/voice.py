@@ -57,7 +57,7 @@ def listen_auto(timeout: float | None = None, min_level: float = 400.0, pause_s:
     """Hands-free: wait for someone to speak, record until they pause, return the WAV.
 
     A simple energy detector: the first half second measures the room's noise floor; speech is
-    anything well above it. Audio heard while Kojo itself is talking is ignored, so it doesn't
+    anything well above it. Audio heard while Wiggle itself is talking is ignored, so it doesn't
     answer its own voice. Returns None if nobody speaks within `timeout` seconds."""
     import queue
 
@@ -141,11 +141,11 @@ _tts_until = 0.0
 
 
 def speak(text: str) -> None:
-    """Say it out loud without blocking (the arm keeps moving while Kojo talks)."""
+    """Say it out loud without blocking (the arm keeps moving while Wiggle talks)."""
     global _tts_proc
     if not text:
         return
-    print(f"\n  🤖 Kojo: {text}\n", flush=True)
+    print(f"\n  🤖 Wiggle: {text}\n", flush=True)
     if _tts:
         args = [_tts, text]
         if "espeak" in _tts:
@@ -154,7 +154,7 @@ def speak(text: str) -> None:
 
 
 def speaking() -> bool:
-    """True while Kojo is talking, and for a moment after (so the mic doesn't catch the echo)."""
+    """True while Wiggle is talking, and for a moment after (so the mic doesn't catch the echo)."""
     global _tts_until
     if _tts_proc is not None and _tts_proc.poll() is None:
         _tts_until = time.time() + 0.4
