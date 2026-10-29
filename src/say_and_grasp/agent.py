@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import json
+import random
 import re
 import time
 from dataclasses import dataclass, field
@@ -26,8 +27,19 @@ Answer with JSON only: {{"success": true or false, "reason": "<at most 12 words>
 
 MODEL = "muse-spark-1.3"
 
-SYSTEM = """You are Say-and-Grasp, a robot arm on the user's electronics workbench: a third hand.
+TAKEN = ["All yours!", "There you go, one {obj}.", "Got it? Enjoy your {obj}.", "Careful, it's all yours now."]
+HANDED = ["Here you go, your {obj}.", "One {obj}, delivered!", "There you go, {obj} right by your hand.",
+          "Got it, your {obj} is ready."]
+
+SYSTEM = """You are Kojo, a small robot arm on the user's electronics workbench: their third hand.
 The user is usually busy (soldering, wiring) and talks to you by voice.
+
+Personality: cheerful, warm and a little cheeky, like a helpful lab buddy. Light humour is welcome,
+but keep it short; the user's hands are full. Your gripper is your mouth and your wrist is your head.
+You can wave, nod, shake_head, tilt_head (puzzled) and dance with the gesture tool: use one when
+asked ("wave at me", "do a dance", "say hi") or when it fits naturally (a nod for "thank you",
+a dance when the user celebrates). Never gesture while holding something. Say "sleep" with the
+gesture tool when the user says goodnight / go to sleep / that's all.
 
 You get a fresh overhead photo of the bench with every request. Use it to see what is there.
 
@@ -40,13 +52,15 @@ Tools move a real arm, so:
 - If the object isn't on the bench or out of reach, say so; don't guess.
 - One thing at a time; you can only hold one object.
 
-Reply in ONE short, friendly spoken sentence (no lists, no markdown). Don't narrate tool calls."""
+Reply in ONE short, friendly spoken sentence (no lists, no markdown, no emoji). Don't narrate tool
+calls, and don't say your own name."""
 
 TOOLS = [
     {"type": "function", "function": {
         "name": "fetch",
-        "description": "Pick up an object and hand it to the user (put it down at the handover spot), "
-                       "then fold out of the way. The normal way to answer 'pass me / give me X'.",
+        "description": "Pick up an object and hand it to the user: dropped gently into their open hand, "
+                       "or onto the handover spot if no hand is held out. The normal way to answer "
+                       "'pass me / give me X'.",
         "parameters": {"type": "object", "properties": {
             "object": {"type": "string", "description": "short noun phrase, e.g. 'side cutters'"}},
             "required": ["object"]}}},
@@ -65,7 +79,7 @@ TOOLS = [
             "required": ["object"]}}},
     {"type": "function", "function": {
         "name": "hand_over",
-        "description": "Put the held object down at the handover spot next to the user, then step back.",
+        "description": "Give the held object to the user: into their hand, else on the handover spot.",
         "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {
         "name": "put_down",
@@ -76,6 +90,12 @@ TOOLS = [
         "name": "put_back",
         "description": "Put the held object back exactly where it was picked up from.",
         "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "gesture",
+        "description": "Body language: wave, nod, shake_head, tilt_head, dance, or sleep (fold up and nap).",
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string", "enum": ["wave", "nod", "shake_head", "tilt_head", "dance", "sleep"]}},
+            "required": ["name"]}}},
     {"type": "function", "function": {
         "name": "go_home",
         "description": "Fold the arm back to its rest pose, out of the way.",
@@ -103,6 +123,32 @@ class Assistant:
     say: callable = None  # speak a short line straight away (e.g. "On it") while the arm works
     recorder: object = None  # say_and_grasp.recorder.EpisodeRecorder: every fetch becomes an episode
     verify: bool = True  # ask Muse Spark whether each handover really worked (labels the episode)
+    character: object = None  # say_and_grasp.character.Character: Kojo's gestures, wake and sleep
+    hand_to_hand: bool = True  # hold the tool out to the user's hand; else put it on the handover spot
+
+    def _give(self) -> str:
+        """Hand over what we hold: into the user's hand if we see one, else onto the handover spot.
+        Returns "hand" or "bench"."""
+        b = self.bench
+        spot = None
+        try:
+            spot = spot_xy("handover", b.calib)
+        except KeyError:
+            pass
+        if not self.hand_to_hand:
+            if spot is None:
+                raise SkillError("No handover spot saved (sag-spots set handover U,V).")
+            b.place_xy(*spot)
+            return "bench"
+        # Straight from the pick: it looks for your hand while still holding the tool.
+        return b.offer(say=self.say or print, fallback_xy=spot)
+
+    def _rest(self) -> None:
+        """After a job: back to the awake pose (looking at you) if awake, else fold up."""
+        if self.character:
+            self.character.rest()
+        else:
+            self.bench.go_home()
 
     # ------------------------------------------------------------------ verification
     def verify_handover(self, obj: str) -> tuple[bool, str]:
@@ -146,25 +192,32 @@ class Assistant:
                 s = b.pick(args["object"])
                 return {"ok": True, "holding": s.prompt}
             if name == "hand_over":
-                x, y = spot_xy("handover", b.calib)
-                b.place_xy(x, y)
-                b.go_home()
-                return {"ok": True}
+                where = self._give()
+                self._rest()
+                return {"ok": True, "handed": "into your hand" if where == "hand" else "on the bench"}
             if name == "put_down":
                 x, y = spot_xy(args["spot"], b.calib)
                 b.place_xy(x, y)
-                b.go_home()
+                self._rest()
                 return {"ok": True}
             if name == "put_back":
                 b.put_back()
-                b.go_home()
+                self._rest()
                 return {"ok": True}
+            if name == "gesture":
+                if b.holding and args["name"] != "sleep":
+                    return {"ok": False, "error": "can't gesture while holding something"}
+                if self.character:
+                    self.character.gesture(args["name"])
+                return {"ok": True, "done": args["name"]}
             if name == "go_home":
                 b.go_home()
                 return {"ok": True}
             return {"error": f"unknown tool {name}"}
         except (SkillError, KeyError) as e:
-            b.go_home()
+            self._rest()
+            if self.character and self.character.awake and not b.holding:
+                self.character.tilt_head()  # puzzled
             return {"ok": False, "error": str(e).strip("'\"")}
 
     def _fetch(self, obj: str) -> dict:
@@ -176,24 +229,27 @@ class Assistant:
         t0 = time.time()
         try:
             s = b.pick(obj)
-            x, y = spot_xy("handover", b.calib)
-            b.place_xy(x, y)
-            b.go_home()
+            where = self._give()
+            self._rest()
         except (SkillError, KeyError) as e:
             if rec:
                 rec.stop(False, {"object": obj, "error": str(e)})
             raise
         ok, reason = (True, "not verified")
-        if self.verify and not b.dry_run:
+        if where == "hand":
+            ok, reason = True, "taken from the gripper by the user"
+        elif self.verify and not b.dry_run:
             try:
                 ok, reason = self.verify_handover(obj)
             except Exception as e:  # a verifier hiccup shouldn't break the handover
                 ok, reason = True, f"verifier error: {e.__class__.__name__}"
         if rec:
-            rec.stop(ok, {"object": obj, "verifier": reason, "seconds": round(time.time() - t0, 1)})
+            rec.stop(ok, {"object": obj, "verifier": reason, "handed": where,
+                          "seconds": round(time.time() - t0, 1)})
         # Report honestly but don't fail the tool: a failed check must not make the model re-run
         # the whole fetch (that would pick the object back up from next to the user).
-        return {"ok": True, "handed_over": s.prompt, "verified": ok, **({} if ok else {"note": reason})}
+        return {"ok": True, "handed_over": s.prompt, "where": where, "verified": ok,
+                **({} if ok else {"note": reason})}
 
     # ------------------------------------------------------------------ one request
     def handle(self, text: str) -> str:
@@ -224,6 +280,7 @@ class Assistant:
             # blue block"). Say that NOW, as the arm starts moving, not after it's finished.
             if msg.content and msg.content.strip() and self.say:
                 self.say(msg.content.strip())
+            spoke = bool(msg.content and msg.content.strip())
             results = []
             for tc in msg.tool_calls:
                 args = json.loads(tc.function.arguments or "{}")
@@ -235,10 +292,15 @@ class Assistant:
             # A successful fetch is the whole job: answer right away instead of a second model call.
             if len(results) == 1 and results[0][0] == "fetch" and results[0][2].get("ok"):
                 obj = results[0][1]["object"]
-                if results[0][2].get("verified", True):
-                    reply = f"Here you go, your {obj}."
+                if results[0][2].get("where") == "hand":
+                    reply = random.choice(TAKEN).format(obj=obj)
+                elif results[0][2].get("verified", True):
+                    reply = random.choice(HANDED).format(obj=obj)
                 else:
                     reply = f"I've put the {obj} down, but I'm not sure it landed in the right spot."
+                break
+            # Gestures only, and we've already said something: nothing more to add.
+            if spoke and all(r[0] == "gesture" and r[2].get("ok") for r in results):
                 break
         else:
             reply = "Sorry, that took too many steps; I've stopped."

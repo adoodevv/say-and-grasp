@@ -5,6 +5,11 @@
     # then: from home, lift just the wrist until the gripper clears the base
     sag-pick --save-clear
 
+    # hand it to you: hold out your hand, take it when the arm holds it out
+    sag-pick --prompt "screwdriver" --offer
+    # how hard a tug has to be: put a tool in the jaws and pull on it
+    sag-pick --tug-test
+
     # see where the arm can reach (green) in the overhead view
     sag-pick --show-reach
 
@@ -54,6 +59,8 @@ def main() -> None:
     ap.add_argument("--pause", action="store_true",
                     help="stop just above the object so you can check the jaw angle before grasping")
     ap.add_argument("--retries", type=int, default=2, help="re-look and retry this many times after a missed grasp")
+    ap.add_argument("--offer", action="store_true", help="hand it into your hand (let go when you tug)")
+    ap.add_argument("--tug-test", action="store_true", help="show how much a pull moves the joints, and exit")
     ap.add_argument("--dry-run", action="store_true", help="plan and print, don't move")
     ap.add_argument("--yes", action="store_true", help="don't ask before moving")
     ap.add_argument("--save-home", action="store_true", help="record the current pose as home and exit")
@@ -86,6 +93,30 @@ def main() -> None:
         arm.disconnect()
         return
 
+    if args.tug_test:
+        arm = Arm(args.port, args.robot_id)
+        arm.connect()
+        arm.go_clear(gripper=args.open)
+        input("Put a tool between the jaws and hold it there, then Enter (the jaws will close)... ")
+        arm.set_gripper(args.closed)
+        print("Leave it for a second, then pull on the tool now and then. Ctrl+C to stop.")
+        base_q, base_l = arm.read(), arm.read_load()
+        try:
+            while True:
+                q, ld = arm.read(), arm.read_load()
+                dq = np.abs(q - base_q)
+                dq[5] *= 0.5
+                dl = 0 if ld is None or base_l is None else np.abs(ld - base_l).max()
+                bar = "#" * min(40, int(dq.max() * 8))
+                print(f"\r joint moved {dq.max():4.1f} deg  load change {dl:5.0f}  {bar:<40}", end="", flush=True)
+                time.sleep(0.05)
+        except KeyboardInterrupt:
+            print("\nA tug counts when the joint moves more than 2.5 deg or the load changes by over 120.")
+        arm.set_gripper(args.open)
+        arm.go_home(gripper=args.closed)
+        arm.disconnect()
+        return
+
     if args.show_reach:
         calib = load_calib(args.calib)
         path = output("reach.png")
@@ -106,7 +137,11 @@ def main() -> None:
         if not args.yes and not args.dry_run:
             input("Enter to start (Ctrl+C to abort)... ")
         seen = bench.pick(args.prompt, retries=args.retries, pause=args.pause)
-        if args.place_pixel:
+        if args.offer:
+            print("Hold out your hand, palm up, under the camera...")
+            where = bench.offer()
+            print("Taken from the gripper." if where == "hand" else "Nobody took it; put it down.")
+        elif args.place_pixel:
             u, v = (float(s) for s in args.place_pixel.split(","))
             bench.place_pixel(u, v)
         elif args.place_xy:

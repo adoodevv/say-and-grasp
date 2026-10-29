@@ -34,7 +34,7 @@ from .calibration import (
 from .camera import CameraStream, capture
 from .kinematics import Kinematics
 from .paths import CALIB_FILE, URDF_FILE, WRIST_FILE, output
-from .sam import Detection, GraspTarget, draw_overlay, grasp_from_mask, segment_robust
+from .sam import Detection, GraspTarget, draw_overlay, grasp_from_mask, segment, segment_robust
 
 
 def _wrap90(a: float) -> float:
@@ -375,6 +375,113 @@ class Bench:
         self.arm.move(above, settle_s=SETTLE_WAYPOINT)
         self.log(f"[place] put down at ({x*1000:.0f}, {y*1000:.0f}) mm")
         self.holding = None
+
+    # ------------------------------------------------------------------ hand-to-hand
+    def find_hand(self, frame: np.ndarray | None = None,
+                  exclude_xy: tuple[float, float] | None = None) -> tuple[float, float] | None:
+        """Look for the user's hand in the overhead view -> (x, y) in the arm frame, or None.
+
+        Works with the arm in view: anything within 8 cm of `exclude_xy` (where the gripper is) is
+        ignored, so the robot's own gripper is never mistaken for a hand. The hand is held above
+        the table, so its position is a little off (parallax); the drop is forgiving of that."""
+        frame = self.snapshot() if frame is None else frame
+        best = None
+        for p in ("hand", "open hand", "palm"):
+            for det in segment(frame, p):
+                ys, xs = np.nonzero(det.mask)
+                if len(xs) < 50:
+                    continue
+                u, v = float(xs.mean()), float(ys.mean())
+                x, y, _ = pixel_to_base(u, v, self.calib)
+                if exclude_xy is not None and math.hypot(x - exclude_xy[0], y - exclude_xy[1]) < 0.08:
+                    continue
+                if best is None or len(xs) > best[0]:
+                    best = (len(xs), x, y, u, v, det.mask)
+            if best:
+                break
+        if best is None:
+            return None
+        _, x, y, u, v, mask = best
+        overlay = frame.copy()
+        overlay[mask] = (0.5 * overlay[mask] + (0, 110, 255)).clip(0, 255).astype(np.uint8)
+        cv2.circle(overlay, (int(u), int(v)), 8, (0, 0, 255), -1)
+        cv2.imwrite(str(output("hand.png")), overlay)
+        self.log(f"[hand] pixel ({u:.0f},{v:.0f}) -> ({x*1000:.0f}, {y*1000:.0f}) mm")
+        return x, y
+
+    def _offer_pose(self, x: float, y: float, height: float) -> tuple[np.ndarray, float, float]:
+        """Joints to hold the tool `height` above the table at (x, y), pulled into reach if needed."""
+        r = math.hypot(x, y)
+        lo, hi = REACH_MIN + 0.01, REACH_MAX - 0.02
+        if r < lo or r > hi:
+            s = min(max(r, lo), hi) / max(r, 1e-6)
+            x, y = x * s, y * s
+        cd = self.holding.close_dir if self.holding else 0.0
+        z0 = table_z_at(x, y, self.calib)
+        for h in (height, height - 0.02, height - 0.04):
+            res = self.kin.topdown(x, y, z0 + h, cd)
+            if res.ok:
+                return res.joints, x, y
+        raise SkillError("I can't hold it out that far.")
+
+    def offer(self, wait_hand_s: float = 8.0, height_mm: float = 90.0, say=print,
+              fallback_xy: tuple[float, float] | None = None) -> str:
+        """Drop the held tool into the user's open hand.
+
+        Straight from the pick (no trip home): looks for a hand in the overhead view while still
+        holding the tool, moves over it and lets go a few centimetres above the palm. If no hand
+        shows up in `wait_hand_s` seconds, puts the tool down at `fallback_xy` instead.
+        Returns "hand" or "bench"."""
+        if self.holding is None and not self.dry_run:
+            raise SkillError("I'm not holding anything.")
+        here = (self.holding.x, self.holding.y) if self.holding else None
+        t0 = time.time()
+        found = None
+        asked = closer = False
+        far = REACH_MAX - 0.02 + 0.03  # beyond this a drop would miss the palm
+        while time.time() - t0 < wait_hand_s:
+            found = self.find_hand(exclude_xy=here)
+            if found and math.hypot(*found) <= far:
+                break
+            if found:
+                self.log(f"[offer] hand at {math.hypot(*found)*100:.0f} cm: out of reach")
+                if not closer:
+                    say("Bring your hand a little closer.")
+                    closer = True
+                found = None
+            elif not asked:
+                say("Hold out your hand.")
+                asked = True
+            time.sleep(0.2)
+        if not found:
+            self.log("[offer] no hand seen; putting it down instead")
+            if fallback_xy is None:
+                raise SkillError("I couldn't see your hand.")
+            self.place_xy(*fallback_xy)
+            return "bench"
+        q, ox, oy = self._offer_pose(*found, height_mm / 1000)
+        if self.dry_run:
+            self.log(f"[offer] dry run: would drop it at ({ox*1000:.0f}, {oy*1000:.0f}) mm")
+            self.holding = None
+            return "hand"
+        arm = self.arm
+        old = arm.speed
+        arm.speed = min(old, 40)  # moving towards a person: a touch gentler
+        try:
+            arm.move(q, settle_s=0.3)
+        finally:
+            arm.speed = old
+        time.sleep(0.3)
+        arm.set_gripper(self.g_open)  # drop it into the palm
+        self.holding = None
+        time.sleep(0.2)
+        try:  # rise straight up, clear of the hand, before going anywhere
+            arm.move(self._offer_pose(ox, oy, height_mm / 1000 + 0.05)[0], settle_s=0.1)
+        except SkillError:
+            pass
+        self.log(f"[offer] dropped into your hand at ({ox*1000:.0f}, {oy*1000:.0f}) mm, "
+                 f"{time.time() - t0:.1f}s after the pick")
+        return "hand"
 
     def place_pixel(self, u: float, v: float) -> None:
         x, y, _ = pixel_to_base(u, v, self.calib)

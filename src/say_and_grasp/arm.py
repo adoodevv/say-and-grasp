@@ -146,6 +146,53 @@ class Arm:
             self.move(clear, gripper=gripper, settle_s=0.1)
         self.move(home, gripper=gripper, settle_s=0.3)
 
+    def read_load(self) -> np.ndarray | None:
+        """Present_Load of the 6 motors (raw Feetech units, signed), or None if the bus won't say."""
+        try:
+            raw = self.robot.bus.sync_read("Present_Load", normalize=False)
+        except Exception:
+            return None
+        return np.array([float(raw.get(n, 0)) for n in ARM_JOINTS + ["gripper"]], dtype=float)
+
+    def wait_for_tug(self, timeout: float = 10.0, joint_deg: float = 2.5, load_jump: float = 120.0,
+                     hz: float = 30.0, log=None) -> bool:
+        """Hold still and wait for someone to pull on what the gripper holds.
+
+        A pull shows up as the joints being dragged off their commanded pose (the servos are
+        stiff but not rigid) and, where the servos report it, as a jump in motor load. Both are
+        measured against a baseline taken while nobody touches the arm. Returns True on a tug,
+        False after `timeout` seconds."""
+        base_q, base_l = [], []
+        t_end = time.time() + timeout
+        n_base = int(0.5 * hz)
+        use_load = True
+        peak = 0.0
+        while time.time() < t_end:
+            s = self.read()
+            q = np.append(s[:5], s[5])
+            ld = self.read_load() if use_load else None
+            if use_load and ld is None:
+                use_load = False
+            if len(base_q) < n_base:
+                base_q.append(q)
+                if ld is not None:
+                    base_l.append(ld)
+                time.sleep(1.0 / hz)
+                continue
+            dq = np.abs(q - np.median(base_q, axis=0))
+            dq[5] *= 0.5  # gripper reading is in 0-100, not degrees
+            score = float(dq.max())
+            dl = float(np.abs(ld - np.median(base_l, axis=0)).max()) if (ld is not None and base_l) else 0.0
+            peak = max(peak, score)
+            if score > joint_deg or dl > load_jump:
+                if log:
+                    log(f"[offer] tug felt (joint moved {score:.1f} deg, load change {dl:.0f})")
+                return True
+            time.sleep(1.0 / hz)
+        if log:
+            log(f"[offer] no tug in {timeout:.0f}s (largest joint movement {peak:.1f} deg)")
+        return False
+
     def set_gripper(self, value: float) -> None:
         """Open/close in place: holds the last commanded arm pose, so the arm doesn't sink."""
         self.move(self.q_cmd if self.q_cmd is not None else self.joints(), gripper=value, settle_s=0.35)
