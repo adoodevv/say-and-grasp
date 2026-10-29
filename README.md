@@ -14,18 +14,7 @@ Low-cost robot arms could help, but today they learn one task at a time from doz
 
 ## How it works
 
-```mermaid
-flowchart LR
-    V["🎙️ 'pass me the<br/>side cutters'"] --> T[Muse Voice Transcribe]
-    T --> S["Muse Spark<br/>+ bench photo<br/>(decides what to fetch)"]
-    S -->|"fetch('side cutters')"| O["SAM 3.1<br/>overhead camera<br/>(where is it?)"]
-    O --> A["Arm moves above it"]
-    A --> W["SAM 3.1<br/>wrist camera<br/>(centre + square the jaws)"]
-    W -->|"off? correct and re-check"| W
-    W --> G["Grasp → check grip<br/>→ hand over"]
-    G --> J["Muse Spark<br/>checks the handover"]
-    J --> D[("LeRobot dataset<br/>episode + label")]
-```
+You say *"pass me the side cutters"*. **Muse Voice Transcribe** turns it into text, and **Muse Spark** reads the request alongside a fresh photo of the bench. It works out which tool you mean and calls the robot's **`fetch`** tool. **SAM 3.1** finds the tool in the **overhead camera**; its outline gives a grasp point and jaw angle, which the calibration turns into a position on the table. The arm moves above the tool, and **SAM 3.1** looks again through the **wrist camera**. If the jaws are off-centre or not square to the tool, it **corrects and re-checks** until they're lined up. Then it **grasps, checks the grip, and hands the tool over**. Finally, **Muse Spark checks the handover** in the overhead view, and the whole run is saved as a **LeRobot dataset episode** with that verdict as its label.
 
 | Step | Meta model | What it does |
 |---|---|---|
@@ -39,6 +28,7 @@ flowchart LR
 ![Wrist-camera alignment before grasping](docs/images/wrist_alignment.jpg)
 
 ### Behaviour that makes it feel alive
+
 - **Never grabs blind.** It descends only when the wrist camera confirms the jaws are centred and square on the object.
 - **Follows a moved object.** Nudge the tool while the arm is on its way and the wrist camera sees where it went; the arm follows it and re-aligns.
 - **Recovers from a miss in place.** If the grip comes up empty, it rises, looks again and re-grabs without going back home.
@@ -133,4 +123,4 @@ To keep the judging clear: the SO-101 arm hardware and its LeRobot setup (motor 
 
 ## License
 
-MIT
+[MIT](LICENSE)
