@@ -9,6 +9,7 @@ build/
 
 # Large / third-party assets (fetched per README)
 assets/SO101/
+assets/voices/
 
 # Debug images and logs
 outputs/

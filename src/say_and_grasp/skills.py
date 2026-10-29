@@ -483,6 +483,53 @@ class Bench:
                  f"{time.time() - t0:.1f}s after the pick")
         return "hand"
 
+    # ------------------------------------------------------------------ point / put away
+    def point_at(self, x: float, y: float, height_mm: float = 80.0) -> bool:
+        """Hover over (x, y) and give a little wiggle: "it's right here". Returns False when the spot
+        is out of reach (it then points from the edge of its reach, towards the spot)."""
+        r = math.hypot(x, y)
+        reachable = REACH_MIN <= r <= REACH_MAX
+        q, px, py = self._offer_pose(x, y, height_mm / 1000)
+        if self.dry_run:
+            self.log(f"[point] dry run: ({px*1000:.0f}, {py*1000:.0f}) mm")
+            return reachable
+        arm = self.arm
+        arm.leave_home()
+        arm.move(q, settle_s=0.2)
+        for d in (10, -10, 10, -10, 0):  # wiggle the wrist
+            w = q.copy()
+            w[3] += d
+            arm.move(w, settle_s=0)
+        self.log(f"[point] at ({px*1000:.0f}, {py*1000:.0f}) mm" + ("" if reachable else " (edge of reach)"))
+        return reachable
+
+    def drop_into(self, container: str, rim_mm: float = 50.0, clearance_mm: float = 40.0) -> Seen:
+        """Drop what we're holding into a container found by name ("tray", "cup", "bin").
+
+        The container is found fresh each time with SAM 3.1, so it can sit anywhere in reach. The
+        tool is let go `clearance_mm` above the container's rim (`rim_mm` above the table)."""
+        if self.holding is None and not self.dry_run:
+            raise SkillError("I'm not holding anything.")
+        box = self.look(container)
+        if not (REACH_MIN <= box.reach <= REACH_MAX):
+            raise SkillError(f"The {container} is out of my reach; can you move it closer?")
+        q, _, _ = self._offer_pose(box.x, box.y, (rim_mm + clearance_mm) / 1000)
+        if self.dry_run:
+            self.log(f"[put away] dry run: into the {container} at ({box.x*1000:.0f}, {box.y*1000:.0f}) mm")
+            self.holding = None
+            return box
+        arm = self.arm
+        arm.move(q, settle_s=0.25)
+        arm.set_gripper(self.g_open)
+        self.holding = None
+        time.sleep(0.2)
+        try:
+            arm.move(self._offer_pose(box.x, box.y, (rim_mm + clearance_mm + 40) / 1000)[0], settle_s=0.1)
+        except SkillError:
+            pass
+        self.log(f"[put away] dropped into the {container} at ({box.x*1000:.0f}, {box.y*1000:.0f}) mm")
+        return box
+
     def place_pixel(self, u: float, v: float) -> None:
         x, y, _ = pixel_to_base(u, v, self.calib)
         self.place_xy(x, y)

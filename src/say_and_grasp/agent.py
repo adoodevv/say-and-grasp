@@ -19,6 +19,7 @@ import numpy as np
 
 from .sam import get_client
 from .skills import Bench, SkillError
+from .memory import Memory
 from .spots import load_spots, spot_xy
 
 VERIFY_PROMPT = """This is an overhead photo of a robot's workbench. The green circle marks the handover spot.
@@ -51,9 +52,17 @@ Tools move a real arm, so:
   Use pick_up/hand_over/put_down/put_back only for other jobs (tidying, moving things around).
 - If the object isn't on the bench or out of reach, say so; don't guess.
 - One thing at a time; you can only hold one object.
+- "Where's my X?" -> locate(X): it points at it if it's on the bench, or tells you what last
+  happened to it (handed to the user, put in the tray...). Answer like a friend would: "Right
+  there, next to the solder spool" or "I handed it to you about ten minutes ago".
+- "Tidy up" -> call put_away(object, container) once for EACH loose tool you see in the photo,
+  one per turn, smallest job first. Skip the container itself and anything already inside it.
+  Use the container you see (tray, cup, bin, box). When they're all away, reply once.
+- The state line lists what you remember about the bench; use it.
 
-Reply in ONE short, friendly spoken sentence (no lists, no markdown, no emoji). Don't narrate tool
-calls, and don't say your own name."""
+Reply in ONE short, friendly spoken sentence (no lists, no markdown, no emoji), and don't say your
+own name. Anything you write alongside a tool call is spoken immediately, so keep it to two to four
+words ("On it!", "Let me look.") or write nothing; never repeat it in your final reply."""
 
 TOOLS = [
     {"type": "function", "function": {
@@ -91,6 +100,20 @@ TOOLS = [
         "description": "Put the held object back exactly where it was picked up from.",
         "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {
+        "name": "locate",
+        "description": "Answer 'where is my X': looks for it, points at it with the gripper if it's on the "
+                       "bench, else returns what you last did with it and when.",
+        "parameters": {"type": "object", "properties": {
+            "object": {"type": "string", "description": "short noun phrase, e.g. 'multimeter'"}},
+            "required": ["object"]}}},
+    {"type": "function", "function": {
+        "name": "put_away",
+        "description": "Pick up an object and drop it into a container on the bench (for tidying up).",
+        "parameters": {"type": "object", "properties": {
+            "object": {"type": "string", "description": "short noun phrase, e.g. 'side cutters'"},
+            "container": {"type": "string", "description": "what to put it in, e.g. 'tray', 'cup'"}},
+            "required": ["object", "container"]}}},
+    {"type": "function", "function": {
         "name": "gesture",
         "description": "Body language: wave, nod, shake_head, tilt_head, dance, or sleep (fold up and nap).",
         "parameters": {"type": "object", "properties": {
@@ -118,13 +141,14 @@ class Assistant:
     model: str = MODEL
     reasoning_effort: str = "minimal"
     history: list[dict] = field(default_factory=list)
-    max_steps: int = 8
+    max_steps: int = 14  # tidying up is one put_away per tool
     log: callable = print
     say: callable = None  # speak a short line straight away (e.g. "On it") while the arm works
     recorder: object = None  # say_and_grasp.recorder.EpisodeRecorder: every fetch becomes an episode
     verify: bool = True  # ask Muse Spark whether each handover really worked (labels the episode)
     character: object = None  # say_and_grasp.character.Character: Wiggle's gestures, wake and sleep
     hand_to_hand: bool = True  # hold the tool out to the user's hand; else put it on the handover spot
+    memory: Memory = field(default_factory=Memory)  # where things were last seen / what happened to them
 
     def _give(self) -> str:
         """Hand over what we hold: into the user's hand if we see one, else onto the handover spot.
@@ -184,24 +208,37 @@ class Assistant:
         try:
             if name == "find":
                 s = b.look(args["object"])
+                self.memory.note(args["object"], "seen on the bench", s.x, s.y)
                 return {"found": True, "position_cm": [round(s.x * 100, 1), round(s.y * 100, 1)],
                         "reachable": 0.16 <= s.reach <= 0.28}
             if name == "fetch":
                 return self._fetch(args["object"])
             if name == "pick_up":
                 s = b.pick(args["object"])
+                self.memory.note(args["object"], "picked up (holding it)", s.x, s.y)
                 return {"ok": True, "holding": s.prompt}
+            if name == "locate":
+                return self._locate(args["object"])
+            if name == "put_away":
+                return self._put_away(args["object"], args.get("container") or "tray")
             if name == "hand_over":
+                held = b.holding.prompt if b.holding else "it"
                 where = self._give()
+                self.memory.note(held, "handed to the user" if where == "hand" else "put on the handover spot")
                 self._rest()
                 return {"ok": True, "handed": "into your hand" if where == "hand" else "on the bench"}
             if name == "put_down":
                 x, y = spot_xy(args["spot"], b.calib)
+                held = b.holding.prompt if b.holding else "it"
                 b.place_xy(x, y)
+                self.memory.note(held, f"put down at the {args['spot']} spot", x, y)
                 self._rest()
                 return {"ok": True}
             if name == "put_back":
+                held = b.holding
                 b.put_back()
+                if held:
+                    self.memory.note(held.prompt, "put back where it was", held.x, held.y)
                 self._rest()
                 return {"ok": True}
             if name == "gesture":
@@ -218,7 +255,53 @@ class Assistant:
             self._rest()
             if self.character and self.character.awake and not b.holding:
                 self.character.tilt_head()  # puzzled
-            return {"ok": False, "error": str(e).strip("'\"")}
+            err = {"ok": False, "error": str(e).strip("'\"")}
+            if "can't see" in err["error"] and args.get("object"):
+                last = self.memory.recall(args["object"])
+                if last:
+                    err["last_seen"] = f"{last['event']} {last['when']}"
+            return err
+
+    def _locate(self, obj: str) -> dict:
+        """Point at it if it's on the bench; otherwise say what last happened to it."""
+        b = self.bench
+        try:
+            s = b.look(obj)
+        except SkillError:
+            last = self.memory.recall(obj)
+            if last:
+                return {"found": False, "last_seen": f"{last['event']} {last['when']}"}
+            return {"found": False, "last_seen": "never seen it"}
+        self.memory.note(obj, "seen on the bench", s.x, s.y)
+        reachable = b.point_at(s.x, s.y)
+        self._rest()
+        return {"found": True, "pointed_at_it": True, "within_reach": reachable,
+                "position_cm": [round(s.x * 100, 1), round(s.y * 100, 1)]}
+
+    def _put_away(self, obj: str, container: str) -> dict:
+        """Pick it up and drop it into the container; recorded as an episode like a fetch."""
+        b = self.bench
+        rec = self.recorder
+        if rec:
+            rec.start(f"put the {obj} in the {container}")
+        t0 = time.time()
+        try:
+            s = b.pick(obj)
+            box = b.drop_into(container)
+        except (SkillError, KeyError) as e:
+            if b.holding:  # couldn't find the container: don't keep holding it
+                try:
+                    b.put_back()
+                except SkillError:
+                    pass
+            if rec:
+                rec.stop(False, {"object": obj, "container": container, "error": str(e)})
+            raise
+        self.memory.note(obj, f"put in the {container}", box.x, box.y)
+        if rec:
+            rec.stop(True, {"object": obj, "container": container, "seconds": round(time.time() - t0, 1)})
+        # Next tool runs straight from here (no rest pose in between): tidying up keeps moving.
+        return {"ok": True, "put_away": s.prompt, "into": container}
 
     def _fetch(self, obj: str) -> dict:
         """Pick + hand over + home, recorded as one episode and checked by Muse Spark."""
@@ -230,6 +313,7 @@ class Assistant:
         try:
             s = b.pick(obj)
             where = self._give()
+            self.memory.note(obj, "handed to the user" if where == "hand" else "put on the handover spot")
             self._rest()
         except (SkillError, KeyError) as e:
             if rec:
@@ -258,13 +342,16 @@ class Assistant:
         spots = ", ".join(load_spots()) or "none saved"
         holding = self.bench.holding.prompt if self.bench.holding else "nothing"
         user = {"role": "user", "content": [
-            {"type": "text", "text": f"{text}\n\n(state: holding {holding}; saved spots: {spots})"},
+            {"type": "text", "text": f"{text}\n\n(state: holding {holding}; saved spots: {spots}; "
+                                     f"you remember: {self.memory.summary()})"},
             {"type": "image_url", "image_url": {"url": _jpeg_data_url(bench_photo)}},
         ]}
         # Keep earlier turns as text only (photos are big and stale).
         messages = [{"role": "system", "content": SYSTEM}, *self.history, user]
         client = get_client()
         reply = ""
+        tidied = False
+        announced = False
         for _ in range(self.max_steps):
             resp = client.chat.completions.create(
                 model=self.model, messages=messages, tools=TOOLS, tool_choice="auto",
@@ -278,9 +365,10 @@ class Assistant:
                              "tool_calls": [tc.model_dump() for tc in msg.tool_calls]})
             # Muse Spark often says what it's about to do alongside the tool call ("I'll grab the
             # blue block"). Say that NOW, as the arm starts moving, not after it's finished.
-            if msg.content and msg.content.strip() and self.say:
-                self.say(msg.content.strip())
             spoke = bool(msg.content and msg.content.strip())
+            if spoke and self.say and not announced:  # once per request: tidying shouldn't chatter
+                self.say(msg.content.strip())
+                announced = True
             results = []
             for tc in msg.tool_calls:
                 args = json.loads(tc.function.arguments or "{}")
@@ -288,6 +376,7 @@ class Assistant:
                 result = self._tool(tc.function.name, args)
                 self.log(f"         -> {result}")
                 results.append((tc.function.name, args, result))
+                tidied |= tc.function.name == "put_away"
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps(result)})
             # A successful fetch is the whole job: answer right away instead of a second model call.
             if len(results) == 1 and results[0][0] == "fetch" and results[0][2].get("ok"):
@@ -304,6 +393,11 @@ class Assistant:
                 break
         else:
             reply = "Sorry, that took too many steps; I've stopped."
+        if tidied:  # put_away leaves the arm over the container, ready for the next one
+            try:
+                self._rest()
+            except SkillError:
+                pass
         self.history += [{"role": "user", "content": text}, {"role": "assistant", "content": reply}]
         self.history = self.history[-12:]
         self.log(f"  [{time.time() - t0:.1f}s]")

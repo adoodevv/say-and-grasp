@@ -16,6 +16,7 @@ dependencies = [
     "placo",
     "httpx",
     "sounddevice",  # microphone (needs the system package libportaudio2)
+    "piper-tts",  # Wiggle's voice (download a voice once: see README)
     # OpenCV: the LeRobot env already ships opencv-python-headless; install one yourself otherwise.
 ]
 

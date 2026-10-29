@@ -35,10 +35,13 @@ GESTURES = ["wave", "nod", "shake_head", "tilt_head", "dance", "wake", "sleep"]
 PAN, LIFT, ELBOW, WFLEX, ROLL = range(5)
 MOUTH_REST = 20.0  # gripper opening while awake
 
-# How the name may come back from speech-to-text.
 # How the name may come back from speech-to-text: Wiggle, Wiggles, Wiggy, Wigle, Wiggel...
 _NAME = r"(?:wig{1,2}(?:le|les|el|al|ly|y|gle)|wriggle|wiggle)"
 _CALL = re.compile(rf"\b(?:(?:hey|hi|hello|yo|ok|okay)[\s,]+)?{_NAME}\b[\s,.!?]*", re.I)
+# Sloppier hearings ("Wego", "we go", "Wiggo", "Vega") only count at the very start of what was
+# said, so "here we go" in conversation doesn't wake it.
+_LOOSE = r"(?:we[\s-]?go+|wiggo|wigo|weego|wego|vega|wigga|weegle|wigl)"
+_CALL_START = re.compile(rf"^\W*(?:(?:hey|hi|hello|yo|ok|okay)[\s,]+)?{_LOOSE}\b[\s,.!?]*", re.I)
 _JUST_CALLING = re.compile(
     r"^(?:wake up|are you (?:there|awake|up)|you there|hello|hi|hey|good morning|morning)?\W*$", re.I)
 
@@ -56,9 +59,12 @@ def heard_name(text: str) -> tuple[bool, str]:
     """Was Wiggle called? Returns (called, what's left of the request).
 
     "Wiggle, pass me the pliers" -> (True, "pass me the pliers"); "hey wiggle!" -> (True, "")."""
-    if not _CALL.search(text):
+    if _CALL.search(text):
+        rest = _CALL.sub(" ", text).strip(" ,.!?")
+    elif _CALL_START.search(text):
+        rest = _CALL_START.sub(" ", text).strip(" ,.!?")
+    else:
         return False, text.strip()
-    rest = _CALL.sub(" ", text).strip(" ,.!?")
     if _JUST_CALLING.match(rest):
         rest = ""
     return True, rest

@@ -23,7 +23,7 @@ import time
 from ..agent import Assistant
 from ..character import Character, heard_name
 from ..skills import Bench
-from ..voice import listen, listen_auto, speak, transcribe
+from ..voice import listen, listen_auto, speak, transcribe, warm_up
 
 
 def main() -> None:
@@ -70,6 +70,7 @@ def main() -> None:
     bot = Assistant(bench, reasoning_effort=args.effort, say=speak, recorder=recorder,
                     verify=not args.no_verify, character=buddy, hand_to_hand=not args.no_hand)
     hands_free = args.hands_free and not args.text
+    warm_up()
     print("Wiggle is asleep. Say its name to wake it" + (" (just talk)." if hands_free else ".")
           + " Ctrl+C to quit.")
 
@@ -80,7 +81,7 @@ def main() -> None:
         if hands_free:
             timeout = max(1.0, buddy.sleep_after_s - (time.time() - buddy.last_active)) if buddy.awake else None
             print("\n  [listening" + ("" if buddy.awake else " for 'Wiggle'") + "...]", flush=True)
-            wav = listen_auto(timeout=timeout)
+            wav = listen_auto(timeout=timeout, log=print)
             if wav is None:
                 return None
         else:
