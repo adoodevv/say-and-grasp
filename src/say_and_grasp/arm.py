@@ -28,6 +28,14 @@ class Arm:
         self.speed = speed_dps
         self.gripper = 50.0
         self.q_cmd: np.ndarray | None = None  # last COMMANDED arm joints (not the sagged reading)
+        # Latest reading / command, for the episode recorder. The recorder must never talk to the
+        # serial bus itself (two readers garble each other's packets), so the arm caches them.
+        import threading
+
+        self._state_lock = threading.Lock()
+        self.last_state: np.ndarray | None = None  # 5 arm joints + gripper, as read
+        self.last_action: np.ndarray | None = None  # 5 arm joints + gripper, as commanded
+        self.track_state = False  # read the bus every control tick (only while recording)
         self.corr = np.zeros(len(ARM_JOINTS))  # learned gravity-sag compensation, degrees
 
     def connect(self, attempts: int = 3) -> None:
@@ -50,21 +58,42 @@ class Arm:
                 except Exception:
                     pass
                 time.sleep(1.0)
-        obs = self.robot.get_observation()
-        self.gripper = float(obs["gripper.pos"])
-        self.q_cmd = self.joints()
+        s = self.read()
+        self.gripper = float(s[5])
+        self.q_cmd = s[:5]
+        with self._state_lock:
+            self.last_action = s.copy()
 
     def disconnect(self) -> None:
         self.robot.disconnect()
 
-    def joints(self) -> np.ndarray:
+    def read(self) -> np.ndarray:
+        """Read all 6 motors (5 arm joints + gripper) and cache them for the recorder."""
         obs = self.robot.get_observation()
-        return np.array([obs[f"{j}.pos"] for j in ARM_JOINTS], dtype=float)
+        s = np.array([obs[f"{j}.pos"] for j in ARM_JOINTS] + [obs["gripper.pos"]], dtype=float)
+        with self._state_lock:
+            self.last_state = s
+        return s
+
+    def joints(self) -> np.ndarray:
+        return self.read()[:5]
+
+    def gripper_pos(self) -> float:
+        return float(self.read()[5])
+
+    def snapshot_state(self) -> tuple[np.ndarray | None, np.ndarray | None]:
+        with self._state_lock:
+            return (None if self.last_state is None else self.last_state.copy(),
+                    None if self.last_action is None else self.last_action.copy())
 
     def _send(self, q: np.ndarray, gripper: float) -> None:
         action = {f"{j}.pos": float(v) for j, v in zip(ARM_JOINTS, q)}
         action["gripper.pos"] = float(gripper)
         self.robot.send_action(action)
+        with self._state_lock:
+            self.last_action = np.array(list(q) + [gripper], dtype=float)
+        if self.track_state:
+            self.read()
 
     def move(self, target: np.ndarray, gripper: float | None = None, hz: float = 30.0,
              settle_s: float = 0.6, max_corr: float = 6.0) -> None:

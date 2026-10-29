@@ -3,6 +3,9 @@
     sag-agent                 # push-to-talk: Enter, speak, Enter
     sag-agent --text          # type requests instead (no microphone needed)
     sag-agent --text --dry-run   # plan only, the arm doesn't move
+    sag-agent --no-record        # don't save episodes to the dataset
+
+Every fetch is recorded as a LeRobot episode in data/ and labelled by Muse Spark (sag-dataset).
 
 Needs a handover spot first:  sag-spots set handover U,V
 """
@@ -26,12 +29,25 @@ def main() -> None:
     ap.add_argument("--closed", type=float, default=5)
     ap.add_argument("--grasp-height", type=float, default=5)
     ap.add_argument("--effort", default="minimal", help="Muse Spark reasoning effort: minimal/low/medium/high")
+    ap.add_argument("--no-record", action="store_true", help="don't record episodes")
+    ap.add_argument("--no-verify", action="store_true", help="skip Muse Spark's check after each handover")
+    ap.add_argument("--repo-id", default=None, help="dataset id (default adoodevv/say-and-grasp-handovers)")
     args = ap.parse_args()
 
+    record = not args.no_record and not args.dry_run
     bench = Bench(port=args.port, robot_id=args.robot_id, camera=args.camera, dry_run=args.dry_run,
-                  gripper_open=args.open, gripper_closed=args.closed, grasp_height_mm=args.grasp_height)
-    bot = Assistant(bench, reasoning_effort=args.effort, say=speak)
+                  gripper_open=args.open, gripper_closed=args.closed, grasp_height_mm=args.grasp_height,
+                  stream_overhead=record)
     bench.connect()
+    recorder = None
+    if record:
+        from ..recorder import DEFAULT_REPO_ID, EpisodeRecorder
+
+        recorder = EpisodeRecorder(bench.arm, bench.overhead_peek, bench.wrist_peek,
+                                   repo_id=args.repo_id or DEFAULT_REPO_ID)
+        print(f"Recording episodes to {recorder.root}")
+    bot = Assistant(bench, reasoning_effort=args.effort, say=speak, recorder=recorder,
+                    verify=not args.no_verify)
     print("Say-and-Grasp ready. Ctrl+C to quit.")
     try:
         while True:
@@ -48,6 +64,8 @@ def main() -> None:
         print("\nBye.")
     finally:
         bench.go_home()
+        if recorder:
+            recorder.close()
         bench.close()
 
 

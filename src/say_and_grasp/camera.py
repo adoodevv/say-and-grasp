@@ -82,6 +82,11 @@ class CameraStream:
             time.sleep(0.005)
         raise RuntimeError("Camera stream stopped delivering frames")
 
+    def peek(self) -> np.ndarray | None:
+        """Newest frame right now, without waiting (None until the first frame arrives)."""
+        with self._lock:
+            return None if self._frame is None else self._frame.copy()
+
     def close(self) -> None:
         self._stop.set()
         self._thread.join(timeout=1.0)

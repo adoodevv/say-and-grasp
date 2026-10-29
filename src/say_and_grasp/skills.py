@@ -97,6 +97,7 @@ class Bench:
         empty_margin: float = 3.0,
         yaw_offset: float = 0.0,
         dry_run: bool = False,
+        stream_overhead: bool = False,
         log=print,
     ):
         self.calib = load_calib(calib_path)
@@ -117,6 +118,8 @@ class Bench:
         self.follow_max = 0.12  # the wrist camera seeing it further than this is probably something else
         self.align_tol_deg = 6.0  # jaws within 6 deg of square is fine
         self.wrist_stream: CameraStream | None = None
+        self.overhead_stream: CameraStream | None = None
+        self._want_overhead_stream = stream_overhead  # needed when recording episodes
 
     # ------------------------------------------------------------------ lifecycle
     def connect(self) -> None:
@@ -129,10 +132,17 @@ class Bench:
             except Exception as e:  # fall back to opening it per photo
                 self.log(f"[wrist] streaming unavailable ({e}); using single shots")
                 self.wrist_stream = None
+        if self._want_overhead_stream and not self.dry_run:
+            try:
+                self.overhead_stream = CameraStream(self.camera)
+            except Exception as e:
+                self.log(f"[overhead] streaming unavailable ({e}); using single shots")
+                self.overhead_stream = None
 
     def close(self) -> None:
-        if self.wrist_stream:
-            self.wrist_stream.close()
+        for st in (self.wrist_stream, self.overhead_stream):
+            if st:
+                st.close()
         if self.arm:
             self.arm.disconnect()
 
@@ -154,7 +164,20 @@ class Bench:
     # ------------------------------------------------------------------ perception
     def snapshot(self) -> np.ndarray:
         """Overhead picture. The arm should be home (out of view) when this is called."""
+        if self.overhead_stream:
+            try:
+                return self.overhead_stream.latest()
+            except RuntimeError:
+                self.log("[overhead] stream stalled; switching to single shots")
+                self.overhead_stream.close()
+                self.overhead_stream = None
         return capture(self.camera)
+
+    def overhead_peek(self) -> np.ndarray | None:
+        return self.overhead_stream.peek() if self.overhead_stream else None
+
+    def wrist_peek(self) -> np.ndarray | None:
+        return self.wrist_stream.peek() if self.wrist_stream else None
 
     def look(self, prompt: str, frame: np.ndarray | None = None) -> Seen:
         """Find `prompt` in the overhead view; pick the most confident/largest match."""
@@ -324,7 +347,7 @@ class Bench:
                 raise SkillError("aborted")
             arm.move(grasp, settle_s=SETTLE_PRECISE)
             arm.set_gripper(self.g_closed)
-            width = float(arm.robot.get_observation()["gripper.pos"])
+            width = arm.gripper_pos()
             if width > self.g_closed + self.empty_margin:
                 arm.move(above, settle_s=SETTLE_WAYPOINT)  # lift
                 self.log(f"[pick] holding {prompt} (gripper at {width:.0f}) after {time.time() - t0:.1f}s")

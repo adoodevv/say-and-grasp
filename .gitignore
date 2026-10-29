@@ -14,3 +14,6 @@ assets/SO101/
 outputs/
 *.png
 !docs/**/*.png
+
+# Recorded episodes (push with sag-dataset --push instead)
+data/

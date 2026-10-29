@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 import time
 from dataclasses import dataclass, field
 
@@ -18,6 +19,10 @@ import numpy as np
 from .sam import get_client
 from .skills import Bench, SkillError
 from .spots import load_spots, spot_xy
+
+VERIFY_PROMPT = """This is an overhead photo of a robot's workbench. The green circle marks the handover spot.
+Did the robot successfully put a {obj} down inside (or touching) the green circle?
+Answer with JSON only: {{"success": true or false, "reason": "<at most 12 words>"}}"""
 
 MODEL = "muse-spark-1.3"
 
@@ -96,6 +101,36 @@ class Assistant:
     max_steps: int = 8
     log: callable = print
     say: callable = None  # speak a short line straight away (e.g. "On it") while the arm works
+    recorder: object = None  # say_and_grasp.recorder.EpisodeRecorder: every fetch becomes an episode
+    verify: bool = True  # ask Muse Spark whether each handover really worked (labels the episode)
+
+    # ------------------------------------------------------------------ verification
+    def verify_handover(self, obj: str) -> tuple[bool, str]:
+        """Muse Spark looks at the overhead view and judges whether `obj` arrived at the handover spot."""
+        from .spots import load_spots
+
+        spots = load_spots()
+        img = self.bench.snapshot()
+        if "handover" in spots:
+            u, v = (int(t) for t in spots["handover"])
+            cv2.circle(img, (u, v), 45, (0, 220, 0), 3)
+        resp = get_client().chat.completions.create(
+            model=self.model, reasoning_effort="minimal",
+            messages=[{"role": "user", "content": [
+                {"type": "text", "text": VERIFY_PROMPT.format(obj=obj)},
+                {"type": "image_url", "image_url": {"url": _jpeg_data_url(img)}},
+            ]}],
+        )
+        text = resp.choices[0].message.content or ""
+        m = re.search(r"\{.*\}", text, re.S)
+        try:
+            verdict = json.loads(m.group(0)) if m else {}
+        except json.JSONDecodeError:
+            verdict = {}
+        ok = bool(verdict.get("success", False))
+        reason = str(verdict.get("reason", text.strip()[:80]))
+        self.log(f"  [verify] {'success' if ok else 'FAILED'}: {reason}")
+        return ok, reason
 
     # ------------------------------------------------------------------ tools
     def _tool(self, name: str, args: dict) -> dict:
@@ -106,11 +141,7 @@ class Assistant:
                 return {"found": True, "position_cm": [round(s.x * 100, 1), round(s.y * 100, 1)],
                         "reachable": 0.16 <= s.reach <= 0.28}
             if name == "fetch":
-                s = b.pick(args["object"])
-                x, y = spot_xy("handover", b.calib)
-                b.place_xy(x, y)
-                b.go_home()
-                return {"ok": True, "handed_over": s.prompt}
+                return self._fetch(args["object"])
             if name == "pick_up":
                 s = b.pick(args["object"])
                 return {"ok": True, "holding": s.prompt}
@@ -135,6 +166,34 @@ class Assistant:
         except (SkillError, KeyError) as e:
             b.go_home()
             return {"ok": False, "error": str(e).strip("'\"")}
+
+    def _fetch(self, obj: str) -> dict:
+        """Pick + hand over + home, recorded as one episode and checked by Muse Spark."""
+        b = self.bench
+        rec = self.recorder
+        if rec:
+            rec.start(f"pick up the {obj} and hand it over")
+        t0 = time.time()
+        try:
+            s = b.pick(obj)
+            x, y = spot_xy("handover", b.calib)
+            b.place_xy(x, y)
+            b.go_home()
+        except (SkillError, KeyError) as e:
+            if rec:
+                rec.stop(False, {"object": obj, "error": str(e)})
+            raise
+        ok, reason = (True, "not verified")
+        if self.verify and not b.dry_run:
+            try:
+                ok, reason = self.verify_handover(obj)
+            except Exception as e:  # a verifier hiccup shouldn't break the handover
+                ok, reason = True, f"verifier error: {e.__class__.__name__}"
+        if rec:
+            rec.stop(ok, {"object": obj, "verifier": reason, "seconds": round(time.time() - t0, 1)})
+        # Report honestly but don't fail the tool: a failed check must not make the model re-run
+        # the whole fetch (that would pick the object back up from next to the user).
+        return {"ok": True, "handed_over": s.prompt, "verified": ok, **({} if ok else {"note": reason})}
 
     # ------------------------------------------------------------------ one request
     def handle(self, text: str) -> str:
@@ -175,7 +234,11 @@ class Assistant:
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps(result)})
             # A successful fetch is the whole job: answer right away instead of a second model call.
             if len(results) == 1 and results[0][0] == "fetch" and results[0][2].get("ok"):
-                reply = f"Here you go, your {results[0][1]['object']}."
+                obj = results[0][1]["object"]
+                if results[0][2].get("verified", True):
+                    reply = f"Here you go, your {obj}."
+                else:
+                    reply = f"I've put the {obj} down, but I'm not sure it landed in the right spot."
                 break
         else:
             reply = "Sorry, that took too many steps; I've stopped."
