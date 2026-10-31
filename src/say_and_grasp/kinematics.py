@@ -79,6 +79,13 @@ class Kinematics:
         self.task = self.solver.add_frame_task(TIP_FRAME, np.eye(4))
         self._set([0.0] * len(ARM_JOINTS))
         self.pan_axis = self.robot.get_T_world_frame("shoulder_link")[:3, 3].copy()  # the arm turns about this
+        self.limits = np.rad2deg([self.robot.get_joint_limits(n) for n in ARM_JOINTS])  # (lo, hi) per joint
+
+    def at_limit(self, q: np.ndarray, margin: float = 2.0) -> bool:
+        """A joint within `margin` degrees of its end stop: the pose is only just reachable, and the
+        arm can't move any further that way to correct (so the wrist camera's corrections stall)."""
+        q = np.asarray(q, dtype=float)
+        return bool(np.any(q <= self.limits[:, 0] + margin) or np.any(q >= self.limits[:, 1] - margin))
 
     def _set(self, joints_deg) -> None:
         for name, v in zip(ARM_JOINTS, np.deg2rad(joints_deg)):
@@ -124,6 +131,10 @@ class Kinematics:
         helps depends on the tool's direction (leaning sideways to the arm doesn't add reach).
         `tilt_deg` in the result is the lean."""
         r = self.topdown(x, y, z, close_dir_deg)
+        if not lean and not r.ok and r.pos_err < 0.006 and r.tilt_deg < 5 and not self.at_limit(r.joints, 0.3):
+            # Straight down only just within reach (a joint near its stop, a few mm short): on the
+            # real arm this grasps much better than leaning, so take it.
+            r = IKResult(r.joints, r.pos_err, r.tilt_deg, True)
         if r.ok and not lean:
             return r
         leans = (15, 30, 45, 60) if lean is None else (lean,)
@@ -159,7 +170,7 @@ class Kinematics:
                     q, pe, z_err, jaw_err = self._solve_T(T, seed)
                     jaw_err = abs(_wrap90(math.degrees(math.atan2(Xl[1], Xl[0])) - (close_dir_deg + flip)))
                     jaw_tilt = math.degrees(math.asin(min(1.0, abs(float(Xl[2])))))  # one jaw lower than the other
-                    if pe < 0.004 and z_err < 10 and jaw_err < 15 and jaw_tilt < 20:
+                    if pe < 0.003 and z_err < 10 and jaw_err < 15 and jaw_tilt < 20 and not self.at_limit(q):
                         return IKResult(q, pe, float(lean), True)
                     if pe < best.pos_err:
                         best = IKResult(q, pe, float(lean), False)
@@ -196,7 +207,7 @@ class Kinematics:
             pe = float(np.linalg.norm((Tr[:3, 3] + Tr[:3, :3] @ self.tcp) - np.array([x, y, z])))
             tilt = math.degrees(math.acos(float(np.clip(-Tr[2, 2], -1, 1))))
             q = np.rad2deg([self.robot.get_joint(n) for n in ARM_JOINTS])
-            res = IKResult(q, pe, tilt, pe < 0.004 and tilt < 25)
+            res = IKResult(q, pe, tilt, pe < 0.003 and tilt < 25 and not self.at_limit(q))
             if res.ok:
                 return res
             if best is None or pe < best.pos_err:

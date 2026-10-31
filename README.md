@@ -35,7 +35,7 @@ You say *"Wiggle, pass me the side cutters"*. **Muse Voice Transcribe** turns it
 ![Wrist-camera alignment before grasping](docs/images/wrist_alignment.jpg)
 
 ### Behaviour that makes it feel alive
-- **Reaches most of the bench.** Straight down where it can, and leaning the gripper in or out near its base and at the far edge, so it grasps from 10 to about 36 cm away (up to 42 cm for some tools).
+- **Reaches most of the bench.** It grasps straight down anywhere from 10 to about 32 cm from its base (hovering lower for far-out tools so it stays straight down), and can lean the gripper to stretch a little further when it has to.
 - **Looks closer when it can't see something.** If SAM 3.1 misses a thin tool in the full view, Muse Spark points out roughly where it is and SAM 3.1 looks again at a close-up of that spot.
 - **Never grabs blind.** It descends only when the wrist camera confirms the jaws are centred and square on the object.
 - **Follows a moved object.** Nudge the tool while the arm is on its way and the wrist camera sees where it went; the arm follows it and re-aligns.

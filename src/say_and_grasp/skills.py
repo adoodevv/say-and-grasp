@@ -119,6 +119,14 @@ class Bench:
         self.holding: Seen | None = None
         # Wrist camera alignment (sag-calibrate --wrist). Without it, picks use the overhead estimate only.
         self.wrist = json.loads(WRIST_FILE.read_text()) if WRIST_FILE.exists() else None
+        if self.wrist and "px_per_m" in self.wrist:
+            # A camera looking straight down sees the same scale in every direction: keep the
+            # calibration's rotation (and mirroring) but one scale, which irons out the noise of
+            # its two short test moves.
+            A = np.array(self.wrist["px_per_m"], dtype=float)
+            U, S, Vt = np.linalg.svd(A)
+            if S[0] / S[1] > 1.4:  # clearly lopsided: noise from the test moves, not the camera
+                self.wrist["px_per_m"] = (float(np.sqrt(S[0] * S[1])) * (U @ Vt)).tolist()
         self.name_hint = None  # optional: prompt -> a fuller name it was seen under before (memory)
         self.locator = None  # optional: (frame, prompt) -> rough (u, v) of it in the frame (Muse Spark)
         # What the wrist camera keeps correcting the overhead estimate by, learned pick by pick.
@@ -292,11 +300,32 @@ class Bench:
     def _plan(self, seen: "Seen") -> tuple[np.ndarray, np.ndarray]:
         """(hover, grasp) joints for a seen object, with the same lean for both so the descent is
         a straight drop along the gripper."""
-        grasp = self._solve("grasp", seen.x, seen.y, seen.z + self.gh, seen.close_dir)
-        lean = self.lean
-        above = self._solve("above object", seen.x, seen.y, seen.z + self.hov, seen.close_dir, lean=lean)
-        if self.lean != lean:  # hover needed a different lean: re-solve the grasp to match it
-            grasp = self._solve("grasp", seen.x, seen.y, seen.z + self.gh, seen.close_dir, lean=self.lean)
+        # One lean that works for both the hover and the grasp (so the descent is straight), the
+        # smallest that does: straight down where possible, leaning more only near the edges.
+        # Far out, a lower hover keeps it straight down (straight-down grasps are much more reliable).
+        self.hover_h = self.hov
+        hovers = (self.hov, 0.035, 0.025)
+        found = False
+        for lean in (0, 15, 30, 45, 60):
+            g = self.kin.grasp(seen.x, seen.y, seen.z + self.gh, seen.close_dir, lean=lean)
+            same = lambda r: abs((r.tilt_deg if r.tilt_deg > 1 else 0.0) - lean) < 1
+            if not (g.ok and same(g)):
+                continue
+            for hov in (hovers if lean == 0 else (self.hov,)):
+                h = self.kin.grasp(seen.x, seen.y, seen.z + hov, seen.close_dir, lean=lean)
+                if h.ok and same(h):
+                    self.lean = float(lean)
+                    self.hover_h = hov
+                    above, grasp = h.joints, g.joints
+                    found = True
+                    break
+            if found:
+                break
+        if found:
+            pass
+        else:  # nothing consistent: fall back to whatever reaches each pose
+            grasp = self._solve("grasp", seen.x, seen.y, seen.z + self.gh, seen.close_dir)
+            above = self._solve("above object", seen.x, seen.y, seen.z + self.hov, seen.close_dir, lean=self.lean)
         if self.lean:
             self.log(f"[plan] leaning the gripper {self.lean:.0f} deg to reach it")
         return above, grasp
@@ -340,9 +369,22 @@ class Bench:
         cv2.drawMarker(vis, tuple(int(t) for t in target), (0, 255, 0), cv2.MARKER_CROSS, 24, 2)
         cv2.imwrite(str(output(save_as)), vis)
         err_px = np.array([g.u, g.v]) - target
+        # A long tool running off the edge of the close-up: the centre of its visible part slides
+        # along it as the gripper moves, so only the sideways error (across the tool, where the jaws
+        # close) means anything. Where along the tool to grab comes from the overhead view.
+        h_img, w_img = det.mask.shape[:2]
+        edge = 3
+        cut = (det.mask[:edge].any() or det.mask[-edge:].any() or det.mask[:, :edge].any()
+               or det.mask[:, -edge:].any())
+        partial = cut and _elongated(det.mask)
+        if partial:
+            across = np.array([math.cos(math.radians(g.yaw_deg)), math.sin(math.radians(g.yaw_deg))])
+            err_px = (err_px @ across) * across
+            self._partial_view = True  # this pick's corrections say nothing about the overhead offset
         px_per_m = np.array(self.wrist["px_per_m"], dtype=float) * scale  # 2x2: pixel error per metre
         offset = self.tool_xy_axes(joints) @ np.linalg.solve(px_per_m, err_px)
-        wrist_label = f"SAM 3.1 wrist: {np.linalg.norm(offset)*1000:.0f} mm off centre"
+        wrist_label = f"SAM 3.1 wrist: {np.linalg.norm(offset)*1000:.0f} mm off centre" + (
+            " (sideways)" if partial else "")
 
         turn = None
         if "target_yaw_px" in self.wrist and _elongated(det.mask):
@@ -366,10 +408,17 @@ class Bench:
         photo. If it sees the object further away (someone moved it), it follows it.
         """
         x, y = seen.x, seen.y
+        hh = getattr(self, "hover_h", self.hov)  # hover height in use (lower far out)
+        d0 = float(self.wrist.get("cam_height", 0.10))  # camera to table at the calibrated hover
+        near_scale = d0 / (d0 + (hh - self.hov))  # closer than calibrated: things look bigger
         widened = False
+        prev_n = None
+        turned = False
+        gain = 1.0  # learned during this alignment: how much of a correction actually happens
+        last_e = None
         for i in range(rounds + 1):
             wide = False
-            m = self.wrist_offset(seen.prompt, above, save_as=f"wrist_{i + 1}.png")
+            m = self.wrist_offset(seen.prompt, above, save_as=f"wrist_{i + 1}.png", scale=near_scale)
             if m is None and not widened:
                 # Not in view: the overhead estimate was further off than the close-up view is wide.
                 # Rise a little for a wider look rather than going all the way back, keeping the same
@@ -377,23 +426,32 @@ class Bench:
                 widened = wide = True
                 high = None
                 for rise in (0.04, 0.03, 0.02):
-                    r = self.kin.grasp(x, y, seen.z + self.hov + rise, seen.close_dir, lean=self.lean or None)
+                    r = self.kin.grasp(x, y, seen.z + hh + rise, seen.close_dir, lean=self.lean or None)
                     if r.ok and abs((r.tilt_deg if r.tilt_deg > 1 else 0.0) - self.lean) < 1:
                         high = r.joints
                         break
                 if high is not None:
                     self.log("[align] not in view; rising for a wider look")
                     self.arm.move(high, settle_s=SETTLE_PRECISE)
-                    d0 = float(self.wrist.get("cam_height", 0.10))  # camera to table at normal hover
-                    m = self.wrist_offset(seen.prompt, high, save_as=f"wrist_{i + 1}w.png", scale=d0 / (d0 + rise))
-                    look_from, look_h = high, self.hov + rise
+                    m = self.wrist_offset(seen.prompt, high, save_as=f"wrist_{i + 1}w.png",
+                                          scale=d0 / (d0 + (hh - self.hov) + rise))
+                    look_from, look_h = high, hh + rise
             else:
-                look_from, look_h = above, self.hov
+                look_from, look_h = above, hh
             if m is None:
                 self.log("[align] can't see it in the wrist camera")
                 return x, y, above, "lost"
             d, turn = m
             e = d + self._camera_centre(look_from, look_h)  # where it is relative to the grasp centre
+            if self.lean >= 25:
+                # Leaning steeply, the camera looks far out ahead and its in/out reading isn't
+                # reliable: keep only the sideways part (across the lean); in/out comes from the
+                # overhead view.
+                zt = self.kin.fk_tcp(look_from)[:3, 2]
+                ld = np.array([zt[0], zt[1]])
+                if np.linalg.norm(ld) > 1e-3:
+                    ld = ld / np.linalg.norm(ld)
+                    e = d - (d @ ld) * ld
             n = float(np.hypot(*e))
             t = abs(turn) if turn is not None else 0.0
             status = f"{n*1000:.0f} mm off" + (f", {turn:+.0f} deg" if turn is not None else "")
@@ -403,21 +461,40 @@ class Bench:
             if n > self.follow_max:
                 self.log(f"[align] what I see is {n*100:.0f} cm away; probably not it")
                 return x, y, above, "lost"
+            if (prev_n is not None and not wide and not turned and prev_n > 2 * self.align_tol
+                    and n > self.align_tol and n > 0.95 * prev_n and gain >= 2.0):
+                # The last correction didn't bring it closer: the arm isn't getting where it's sent
+                # (edge of reach, a joint at its stop). Don't drift on until it's out of view.
+                self.log(f"[align] {status}, not getting closer (edge of my reach?)")
+                return x, y, above, "close" if n < 2 * self.align_tol else "stuck"
+            prev_n = None if wide else n
             if i == rounds:
                 ok = n < 2 * self.align_tol and t < 2 * self.align_tol_deg
                 self.log(f"[align] {status} after {rounds} corrections; " + ("close enough" if ok else "not grabbing blind"))
                 return x, y, above, "close" if ok else "stuck"
-            nx, ny = x + e[0], y + e[1]
-            cd = seen.close_dir + turn if (turn is not None and self.align_tol_deg <= t <= 60) else seen.close_dir
+            if last_e is not None and not wide and not turned:
+                # How much of the last correction actually happened (servo slack, a scale error):
+                # if only part of it, push proportionally harder next time.
+                done = 1.0 - float(e @ last_e) / max(float(last_e @ last_e), 1e-9)
+                if 0.15 < done < 0.9:
+                    gain = float(np.clip(gain / done, 1.0, 2.5))
+            last_e = None if wide else e.copy()
+            step = e * (gain if not wide else 1.0)
+            nx, ny = x + step[0], y + step[1]
+            turned = turn is not None and self.align_tol_deg <= t <= 60
+            # Leaning steeply, the wrist camera sees the tool foreshortened and over-reads its angle.
+            gain = 0.6 if self.lean >= 25 else 1.0
+            cd = seen.close_dir + gain * turn if turned else seen.close_dir
             try:
-                new_above = self._solve("above object", nx, ny, seen.z + self.hov, cd, lean=self.lean)
+                new_above = self._solve("above object", nx, ny, seen.z + hh, cd, lean=self.lean)
             except SkillError as err:
                 self.log(f"[align] it's moved out of reach ({err})")
                 return x, y, above, "lost"
             x, y, seen.close_dir, above = nx, ny, cd, new_above
             trusted = not wide and n < self.trust and t < 12
             self.log(f"[align] {status}; " + ("following it" if n > self.align_max else
-                                             "small correction, going for it" if trusted else "correcting"))
+                                             "small correction, going for it" if trusted else "correcting")
+                     + (f" (x{gain:.1f})" if gain > 1.05 else ""))
             self.arm.move(above, settle_s=SETTLE_WAYPOINT if trusted else SETTLE_PRECISE)
             if trusted:
                 return x, y, above, "centred"
@@ -517,9 +594,10 @@ class Bench:
                 self.log(f"[pick] attempt {attempt + 1}/{retries + 1}")
             if self.wrist:
                 before = (seen.x, seen.y, seen.close_dir)
+                self._partial_view = False
                 x, y, above, status = self._align(seen, above)  # may also turn seen.close_dir
                 seen.x, seen.y = x, y  # so put_back() returns it to where it really was
-                if attempt == 0 and status in ("centred", "close"):
+                if attempt == 0 and status in ("centred", "close") and not self._partial_view:
                     self._learn_bias(before, seen)
                 if status in ("lost", "stuck"):
                     # Don't close on nothing: step back and find it again from above.

@@ -10,9 +10,9 @@ import numpy as np
 
 from .paths import CALIB_FILE
 
-# Where the SO-101 can grasp in any direction (metres from the base); further out for some tool
-# directions by leaning the gripper. Close to the base, watch that the gripper clears the arm.
-REACH_MIN, REACH_MAX = 0.10, 0.36
+# Where the SO-101 grasps reliably, straight down (metres from the base). Beyond ~32 cm it can still
+# lean out to ~40 cm for some tool directions, but leaning grasps catch objects by an edge more often.
+REACH_MIN, REACH_MAX = 0.10, 0.32
 PAN_AXIS = (0.0388, 0.0)  # the shoulder pan axis in the base frame (SO-101 URDF)
 
 
