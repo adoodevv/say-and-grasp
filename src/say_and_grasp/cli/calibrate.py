@@ -38,7 +38,7 @@ from ..sam import draw_overlay, grasp_from_mask, segment_robust
 
 def locate_marker(frame: np.ndarray, prompt: str, save_as: Path) -> tuple[float, float] | None:
     """Find the marker with SAM 3.1 and return its mask centroid. Asks you if it's ambiguous."""
-    dets, _ = segment_robust(frame, prompt)
+    dets, _ = segment_robust(frame, prompt, max_side=min(1280, max(frame.shape[:2])))
     grasps = [grasp_from_mask(d.mask) for d in dets]
     cv2.imwrite(str(save_as), draw_overlay(frame, dets, grasps) if dets else frame)
 
@@ -228,6 +228,8 @@ def main() -> None:
     ap.add_argument("--robot-id", default="my_follower")
     ap.add_argument("--points", type=int, default=8, help="number of touch points (min 4, 8 recommended)")
     ap.add_argument("--mjpg", action="store_true", help="force MJPG (only if two cameras fight over USB bandwidth)")
+    ap.add_argument("--resolution", default="1920x1080",
+                    help="overhead camera resolution to calibrate (and then run) at, e.g. 1920x1080 or 640x480")
     ap.add_argument("--urdf", default=str(URDF_FILE))
     ap.add_argument("--out", default=str(CALIB_FILE))
     ap.add_argument("--refit", action="store_true", help="re-solve from the points saved in --out")
@@ -270,8 +272,29 @@ def main() -> None:
     arm = Arm(args.port, args.robot_id)
     n_points = max(4, args.points)
 
+    res_w, res_h = (int(v) for v in args.resolution.lower().split("x"))
     print("Checking the camera...")
-    capture(args.camera, args.mjpg)
+    test = capture(args.camera, args.mjpg, width=res_w, height=res_h)
+    if (test.shape[1], test.shape[0]) != (res_w, res_h):
+        print(f"  ! The camera gave {test.shape[1]}x{test.shape[0]}, not {res_w}x{res_h}; calibrating at "
+              f"{test.shape[1]}x{test.shape[0]}.")
+    else:
+        print(f"  {res_w}x{res_h} OK")
+    # Spots (e.g. handover) were set as pixels in the old image: keep their table positions.
+    try:
+        from ..spots import freeze
+
+        n = freeze(load_calib(args.out))
+        if n:
+            print(f"  kept the table position of {n} saved spot(s) (handover etc.)")
+    except Exception:
+        pass
+    # The overhead offset Wiggle learned belongs to the old calibration: start that afresh.
+    from ..skills import BIAS_FILE
+
+    if BIAS_FILE.exists():
+        BIAS_FILE.unlink()
+        print("  reset the learned overhead offset (it relearns over the first few picks)")
 
     print("\nConnecting to the arm. Hold it: torque will be switched OFF in a moment.")
     input("Press Enter when you are holding the arm... ")
@@ -307,7 +330,7 @@ def main() -> None:
                 if input().strip().lower() == "y":
                     continue
             input("  Arm out of view? Enter to take the picture... ")
-            frame = capture(args.camera, args.mjpg)
+            frame = capture(args.camera, args.mjpg, width=res_w, height=res_h)
             image_size = [frame.shape[1], frame.shape[0]]
             pt = locate_marker(frame, args.marker, output(f"calib_point_{i + 1}.png"))
             if pt is None:
@@ -331,7 +354,10 @@ def solve_and_save(pixels, points, tilts, camera, image_size, urdf, out, marker_
     surf[:, 2] -= marker_height_mm / 1000  # touched the marker's top -> the table is this much lower
     if marker_height_mm:
         print(f"Correcting for a {marker_height_mm:.0f} mm tall marker (touched on top).")
-    H, fit_err, loo_err = fit_homography(pixels_a, points_a[:, :2])
+    H, radial, fit_err, loo_err = fit_homography(pixels_a, points_a[:, :2])
+    if radial:
+        print(f"Reach correction: {radial[0]*100:+.1f} mm per 10 cm from the base, {radial[1]*1000:+.1f} mm offset "
+              "(absorbs the arm's own reach error)")
     table_z = float(np.median(surf[:, 2]))
 
     print("\nPoint   pixel        base x,y (mm)      fit err   leave-one-out err")
@@ -354,6 +380,7 @@ def solve_and_save(pixels, points, tilts, camera, image_size, urdf, out, marker_
     save_calib(
         {
             "homography": H.tolist(),
+            "radial": radial,
             "table_z": table_z,
             "table_plane": plane.tolist(),
             "marker_height_mm": marker_height_mm,

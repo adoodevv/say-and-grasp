@@ -261,6 +261,9 @@ def speak(text: str) -> None:
     if _same(text, _last_said[0]) and time.time() - _last_said[1] < 30:
         return
     _last_said = (text, time.time())
+    from . import events
+
+    events.publish("say", text=text)
     print(f"\n  🤖 Wiggle: {text}\n", flush=True)
     if _worker is None:
         _load_piper()  # load the voice once, up front

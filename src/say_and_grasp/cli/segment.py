@@ -23,6 +23,7 @@ def main() -> None:
     src.add_argument("--image", help="path to an image file")
     src.add_argument("--camera", help="camera index (e.g. 5) or /dev/v4l/by-id/... path")
     ap.add_argument("--prompt", required=True, help='short noun phrase, e.g. "side cutters"')
+    ap.add_argument("--resolution", default="1920x1080", help="camera resolution, e.g. 1920x1080 or 640x480")
     args = ap.parse_args()
 
     if args.image:
@@ -30,9 +31,10 @@ def main() -> None:
         if img is None:
             sys.exit(f"Could not read {args.image}")
     else:
-        img = capture(args.camera)
+        w, h = (int(v) for v in args.resolution.lower().split("x"))
+        img = capture(args.camera, width=w, height=h)
 
-    dets, _ = segment_robust(img, args.prompt)
+    dets, _ = segment_robust(img, args.prompt, max_side=min(1280, max(img.shape[:2])))
     if not dets:
         print(f"No '{args.prompt}' found.")
         cv2.imwrite(str(output("segment.png")), img)

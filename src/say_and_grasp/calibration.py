@@ -10,10 +10,10 @@ import numpy as np
 
 from .paths import CALIB_FILE
 
-# Annulus the SO-101 can grasp straight down in (metres from the base). Inside ~16 cm the arm
-# has to fold so far that a parallel gripper's base hits the arm; beyond ~28 cm the wrist runs
-# out of range.
-REACH_MIN, REACH_MAX = 0.16, 0.28
+# Where the SO-101 can grasp in any direction (metres from the base); further out for some tool
+# directions by leaning the gripper. Close to the base, watch that the gripper clears the arm.
+REACH_MIN, REACH_MAX = 0.10, 0.36
+PAN_AXIS = (0.0388, 0.0)  # the shoulder pan axis in the base frame (SO-101 URDF)
 
 
 def load_calib(path: str | Path = CALIB_FILE) -> dict:
@@ -49,8 +49,21 @@ def pixel_to_base(u: float, v: float, calib: dict) -> tuple[float, float, float]
     """Overhead pixel -> (x, y, z) on the table surface, metres, arm base frame."""
     H = np.array(calib["homography"], dtype=float)
     p = H @ np.array([u, v, 1.0])
-    x, y = float(p[0] / p[2]), float(p[1] / p[2])
+    x, y = _radial(np.array([[p[0] / p[2], p[1] / p[2]]]), calib.get("radial"))[0]
+    x, y = float(x), float(y)
     return x, y, table_z_at(x, y, calib)
+
+
+def _radial(xy: np.ndarray, coef, sign: float = 1.0) -> np.ndarray:
+    """Distance-from-the-pan-axis correction: r -> r + sign*(c1*r + c0). It absorbs the arm's own
+    reach error (folded close to the base its joint readings are a centimetre or so off), so
+    the mapping matches where the arm actually goes."""
+    if coef is None or len(coef) == 0:
+        return xy
+    a = np.array(PAN_AXIS)
+    rel = xy - a
+    r = np.linalg.norm(rel, axis=1, keepdims=True)
+    return a + rel / np.maximum(r, 1e-9) * (r + sign * np.polyval(coef, r))
 
 
 def pixel_dir_to_base(u: float, v: float, yaw_px_deg: float, calib: dict) -> float:
@@ -61,22 +74,43 @@ def pixel_dir_to_base(u: float, v: float, yaw_px_deg: float, calib: dict) -> flo
     return math.degrees(math.atan2(y1 - y0, x1 - x0))
 
 
-def fit_homography(pixels: np.ndarray, xy: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Least-squares homography plus per-point fit error and leave-one-out error (metres)."""
+def _apply_h(Hm: np.ndarray, pts: np.ndarray) -> np.ndarray:
+    p = np.c_[pts, np.ones(len(pts))] @ Hm.T
+    return p[:, :2] / p[:, 2:3]
+
+
+def _fit_once(pixels: np.ndarray, xy: np.ndarray, radial: bool) -> tuple[np.ndarray, list | None]:
     H, _ = cv2.findHomography(pixels.astype(np.float64), xy.astype(np.float64), 0)
+    if not radial or len(pixels) < 7:
+        return H, None
+    a = np.array(PAN_AXIS)
+    coef = np.zeros(2)
+    for _ in range(6):  # alternate: radial error given H, then H given the radial correction
+        pred = _apply_h(H, pixels)
+        rel = pred - a
+        r = np.linalg.norm(rel, axis=1)
+        r_true = np.einsum("ij,ij->i", xy - a, rel / r[:, None])
+        coef = np.linalg.lstsq(np.c_[r, np.ones_like(r)], r_true - r, rcond=None)[0]
+        H, _ = cv2.findHomography(pixels.astype(np.float64), _radial(xy, coef, sign=-1.0), 0)
+    return H, [float(c) for c in coef]
 
-    def apply(Hm, pts):
-        p = np.c_[pts, np.ones(len(pts))] @ Hm.T
-        return p[:, :2] / p[:, 2:3]
 
-    fit_err = np.linalg.norm(apply(H, pixels) - xy, axis=1)
+def fit_homography(pixels: np.ndarray, xy: np.ndarray, radial: bool = True):
+    """Homography (+ a distance-from-base correction when there are 7+ points). Returns
+    (H, radial coefficients or None, per-point fit error, leave-one-out error), errors in metres."""
+    H, coef = _fit_once(pixels, xy, radial)
+
+    def predict(Hm, c, pts):
+        return _radial(_apply_h(Hm, pts), c)
+
+    fit_err = np.linalg.norm(predict(H, coef, pixels) - xy, axis=1)
     loo_err = np.full(len(pixels), np.nan)
     if len(pixels) >= 5:  # need 4 left over to refit
         for i in range(len(pixels)):
             keep = np.arange(len(pixels)) != i
-            Hi, _ = cv2.findHomography(pixels[keep].astype(np.float64), xy[keep].astype(np.float64), 0)
-            loo_err[i] = np.linalg.norm(apply(Hi, pixels[i : i + 1])[0] - xy[i])
-    return H, fit_err, loo_err
+            Hi, ci = _fit_once(pixels[keep], xy[keep], radial and coef is not None)
+            loo_err[i] = np.linalg.norm(predict(Hi, ci, pixels[i : i + 1])[0] - xy[i])
+    return H, coef, fit_err, loo_err
 
 
 def reach_mask(shape: tuple[int, int], calib: dict, r_min: float = REACH_MIN, r_max: float = REACH_MAX) -> np.ndarray:
@@ -85,7 +119,8 @@ def reach_mask(shape: tuple[int, int], calib: dict, r_min: float = REACH_MIN, r_
     us, vs = np.meshgrid(np.arange(0, w, 4), np.arange(0, h, 4))
     H = np.array(calib["homography"], dtype=float)
     q = H @ np.stack([us.ravel(), vs.ravel(), np.ones(us.size)])
-    r = np.hypot(q[0] / q[2], q[1] / q[2]).reshape(us.shape)
+    xy = _radial(np.c_[q[0] / q[2], q[1] / q[2]], calib.get("radial"))
+    r = np.hypot(xy[:, 0], xy[:, 1]).reshape(us.shape)
     zone = ((r > r_min) & (r < r_max)).astype(np.uint8)
     return cv2.resize(zone, (w, h), interpolation=cv2.INTER_NEAREST).astype(bool)
 

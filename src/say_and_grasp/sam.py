@@ -25,6 +25,7 @@ from meta_sam_parser import (
 BASE_URL = "https://api.meta.ai/v1"
 MODEL = "sam-3.1"
 MAX_SIDE = 640  # downscale before upload: faster round trips, cheaper, enough for grasping
+OVERHEAD_SIDE = 1280  # overhead photos: thin tools (tweezers, a brush) need the extra pixels
 
 
 @dataclass

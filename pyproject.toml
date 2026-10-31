@@ -32,6 +32,8 @@ sag-agent = "say_and_grasp.cli.agent:main"
 sag-spots = "say_and_grasp.spots:main"
 sag-dataset = "say_and_grasp.cli.dataset:main"
 sag-wiggle = "say_and_grasp.cli.wiggle:main"
+sag-train = "say_and_grasp.cli.train:main"
+sag-policy = "say_and_grasp.cli.train:policy_main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

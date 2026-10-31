@@ -1,7 +1,8 @@
 """Named places on the bench, e.g. "handover" (where tools are put down for you).
 
-Stored in config/spots.json as overhead-image pixels, converted to arm coordinates with the
-calibration when used, so they survive a recalibration as long as the camera doesn't move.
+Stored in config/spots.json as a position on the table (arm coordinates), plus the overhead pixel
+it was set at. The table position is what's used, so spots survive a recalibration or a camera
+resolution change.
 
     sag-spots set handover 420,280      # pixel in the overhead image
     sag-spots list
@@ -17,24 +18,51 @@ from .paths import CONFIG_DIR
 SPOTS_FILE = CONFIG_DIR / "spots.json"
 
 
-def load_spots() -> dict[str, list[float]]:
-    if SPOTS_FILE.exists():
-        return json.loads(SPOTS_FILE.read_text())
-    return {}
+def load_spots() -> dict[str, dict]:
+    if not SPOTS_FILE.exists():
+        return {}
+    raw = json.loads(SPOTS_FILE.read_text())
+    # older files stored just [u, v] pixels
+    return {k: (v if isinstance(v, dict) else {"pixel": v}) for k, v in raw.items()}
 
 
-def save_spot(name: str, u: float, v: float) -> None:
-    spots = load_spots()
-    spots[name] = [float(u), float(v)]
+def _write(spots: dict) -> None:
     SPOTS_FILE.parent.mkdir(parents=True, exist_ok=True)
     SPOTS_FILE.write_text(json.dumps(spots, indent=2))
+
+
+def save_spot(name: str, u: float, v: float, calib: dict | None = None) -> None:
+    calib = calib or load_calib()
+    x, y, _ = pixel_to_base(u, v, calib)
+    spots = load_spots()
+    spots[name] = {"pixel": [float(u), float(v)], "image_size": calib.get("image_size", [640, 480]),
+                   "xy": [round(x, 4), round(y, 4)]}
+    _write(spots)
+
+
+def freeze(calib: dict) -> int:
+    """Store every spot's table position using `calib` (call before replacing the calibration)."""
+    spots = load_spots()
+    n = 0
+    for name, s in spots.items():
+        if "xy" not in s:
+            x, y, _ = pixel_to_base(*s["pixel"], calib)
+            s["xy"] = [round(x, 4), round(y, 4)]
+            s.setdefault("image_size", calib.get("image_size", [640, 480]))
+            n += 1
+    if n:
+        _write(spots)
+    return n
 
 
 def spot_xy(name: str, calib: dict | None = None) -> tuple[float, float]:
     spots = load_spots()
     if name not in spots:
         raise KeyError(f"No spot called '{name}'. Set it with: sag-spots set {name} U,V")
-    x, y, _ = pixel_to_base(*spots[name], calib or load_calib())
+    s = spots[name]
+    if "xy" in s:
+        return tuple(s["xy"])
+    x, y, _ = pixel_to_base(*s["pixel"], calib or load_calib())
     return x, y
 
 
@@ -52,10 +80,9 @@ def main() -> None:
         x, y = spot_xy(args.name)
         print(f"Saved '{args.name}' at pixel ({u:.0f},{v:.0f}) -> arm ({x*1000:.0f}, {y*1000:.0f}) mm")
     else:
-        calib = load_calib()
-        for name, (u, v) in load_spots().items():
-            x, y, _ = pixel_to_base(u, v, calib)
-            print(f"{name:12s} pixel ({u:.0f},{v:.0f}) -> arm ({x*1000:.0f}, {y*1000:.0f}) mm")
+        for name in load_spots():
+            x, y = spot_xy(name)
+            print(f"{name:12s} arm ({x*1000:.0f}, {y*1000:.0f}) mm")
 
 
 if __name__ == "__main__":

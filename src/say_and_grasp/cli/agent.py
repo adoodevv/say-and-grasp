@@ -40,6 +40,8 @@ def main() -> None:
     ap.add_argument("--grasp-height", type=float, default=5)
     ap.add_argument("--effort", default="minimal", help="Muse Spark reasoning effort: minimal/low/medium/high")
     ap.add_argument("--no-record", action="store_true", help="don't record episodes")
+    ap.add_argument("--brain-view", action="store_true",
+                    help="record a split-screen video of what Wiggle sees and thinks (outputs/brainview/)")
     ap.add_argument("--no-hand", action="store_true",
                     help="don't hand tools into your hand; always put them on the handover spot")
     ap.add_argument("--no-verify", action="store_true", help="skip Muse Spark's check after each handover")
@@ -51,7 +53,7 @@ def main() -> None:
     record = not args.no_record and not args.dry_run
     bench = Bench(port=args.port, robot_id=args.robot_id, camera=args.camera, dry_run=args.dry_run,
                   gripper_open=args.open, gripper_closed=args.closed, grasp_height_mm=args.grasp_height,
-                  stream_overhead=record)
+                  stream_overhead=True)
     bench.connect()
     recorder = None
     if record:
@@ -71,13 +73,23 @@ def main() -> None:
                     verify=not args.no_verify, character=buddy, hand_to_hand=not args.no_hand)
     hands_free = args.hands_free and not args.text
     warm_up()
+    brain = None
+    if args.brain_view and not args.dry_run:
+        from ..brainview import BrainView
+
+        brain = BrainView(bench.overhead_peek, bench.wrist_peek).start()
     print("Wiggle is asleep. Say its name to wake it" + (" (just talk)." if hands_free else ".")
           + " Ctrl+C to quit.")
 
     def hear() -> str | None:
         """Next thing the user said (None: nobody spoke before it was time to nap)."""
         if args.text:
-            return input("\nyou> ").strip()
+            text = input("\nyou> ").strip()
+            if text:
+                from .. import events
+
+                events.publish("heard", text=text)
+            return text
         if hands_free:
             timeout = max(1.0, buddy.sleep_after_s - (time.time() - buddy.last_active)) if buddy.awake else None
             print("\n  [listening" + ("" if buddy.awake else " for 'Wiggle'") + "...]", flush=True)
@@ -86,8 +98,16 @@ def main() -> None:
                 return None
         else:
             wav = listen("\nEnter to talk... ")
-        text = transcribe(wav)
+        try:
+            text = transcribe(wav)
+        except Exception as e:
+            print(f"  [error] couldn't transcribe ({e.__class__.__name__}); is the internet up?")
+            return ""
         print(f"you> {text}")
+        if text:
+            from .. import events
+
+            events.publish("heard", text=text)
         return text
 
     try:
@@ -107,7 +127,17 @@ def main() -> None:
             if called and not buddy.awake:
                 buddy.wake(quick=True, greet=False)  # "Wiggle, pass me ..." -> perk up and get on with it
             buddy.touch()
-            speak(bot.handle(rest if called else text))
+            try:
+                speak(bot.handle(rest if called else text))
+            except Exception as e:  # network drop, API hiccup: say so and keep going
+                print(f"  [error] {e.__class__.__name__}: {e}")
+                offline = "connect" in e.__class__.__name__.lower() or "network" in str(e).lower()
+                speak("I've lost my internet connection; give me a moment and try again." if offline
+                      else "Sorry, something went wrong there. Try again?")
+                try:
+                    bot._rest()
+                except Exception:
+                    pass
             buddy.touch()
     except (KeyboardInterrupt, EOFError):
         print("\nBye.")
@@ -121,6 +151,8 @@ def main() -> None:
         if recorder:
             print("Finishing the last episode...")
             recorder.close()
+        if brain:
+            brain.close()
         bench.close()
         if recorder and args.push:
             from .dataset import push

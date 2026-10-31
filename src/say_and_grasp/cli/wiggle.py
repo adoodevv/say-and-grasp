@@ -53,7 +53,9 @@ def main() -> None:
             from ..camera import capture
 
             path = output("awake_view.png")
-            cv2.imwrite(str(path), capture(load_calib()["camera"]))
+            c = load_calib()
+            w, h = c.get("image_size", [640, 480])
+            cv2.imwrite(str(path), capture(c["camera"], width=w, height=h))
             print(f"Overhead photo in this pose: {path}. The arm shouldn't cover the bench in it.")
         except Exception as e:
             print(f"(couldn't take the overhead photo: {e})")

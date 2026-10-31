@@ -19,6 +19,7 @@ import numpy as np
 
 from .sam import get_client
 from .skills import Bench, SkillError
+from . import events
 from .memory import Memory
 from .spots import load_spots, spot_xy
 
@@ -45,8 +46,8 @@ gesture tool when the user says goodnight / go to sleep / that's all.
 You get a fresh overhead photo of the bench with every request. Use it to see what is there.
 
 Tools move a real arm, so:
-- Name objects for the vision model with a SHORT concrete phrase: colour + noun when it helps,
-  e.g. "side cutters", "red screwdriver", "blue block", "solder spool". Never pass a description
+- Name objects for the vision model with a SHORT concrete phrase: ALWAYS colour + noun as you see
+  it in the photo, e.g. "red side cutters", "orange screwdriver", "blue block", "black brush". Never pass a description
   of purpose ("thing for cutting wire") to a tool; map it to the object you see in the photo.
 - To give the user something, call fetch(object): it picks it up and hands it over in one go.
   Use pick_up/hand_over/put_down/put_back only for other jobs (tidying, moving things around).
@@ -55,9 +56,10 @@ Tools move a real arm, so:
 - "Where's my X?" -> locate(X): it points at it if it's on the bench, or tells you what last
   happened to it (handed to the user, put in the tray...). Answer like a friend would: "Right
   there, next to the solder spool" or "I handed it to you about ten minutes ago".
-- "Tidy up" -> call put_away(object, container) once for EACH loose tool you see in the photo,
-  one per turn, smallest job first. Skip the container itself and anything already inside it.
-  Use the container you see (tray, cup, bin, box). When they're all away, reply once.
+- "Tidy up" -> call tidy_up ONCE with every loose tool you see in the photo (colour + noun each),
+  in the order to do them (nearest the container last is fine). Leave out the container itself,
+  anything already inside it, and things too big to grip (a multimeter). Use the container you
+  see (tray, cup, bin, box). The robot does them all in one go; reply once when it's done.
 - The state line lists what you remember about the bench; use it.
 
 Reply in ONE short, friendly spoken sentence (no lists, no markdown, no emoji), and don't say your
@@ -107,6 +109,14 @@ TOOLS = [
             "object": {"type": "string", "description": "short noun phrase, e.g. 'multimeter'"}},
             "required": ["object"]}}},
     {"type": "function", "function": {
+        "name": "tidy_up",
+        "description": "Put several loose objects into a container, one after another, without stopping.",
+        "parameters": {"type": "object", "properties": {
+            "objects": {"type": "array", "items": {"type": "string"},
+                        "description": "short noun phrases, e.g. ['blue brush', 'black tweezers']"},
+            "container": {"type": "string", "description": "what to put them in, e.g. 'green tray'"}},
+            "required": ["objects", "container"]}}},
+    {"type": "function", "function": {
         "name": "put_away",
         "description": "Pick up an object and drop it into a container on the bench (for tidying up).",
         "parameters": {"type": "object", "properties": {
@@ -150,6 +160,10 @@ class Assistant:
     hand_to_hand: bool = True  # hold the tool out to the user's hand; else put it on the handover spot
     memory: Memory = field(default_factory=Memory)  # where things were last seen / what happened to them
 
+    def __post_init__(self):
+        mem = self.memory
+        self.bench.name_hint = lambda p: (mem.items[k]["name"] if (k := mem.match(p)) else None)
+
     def _give(self) -> str:
         """Hand over what we hold: into the user's hand if we see one, else onto the handover spot.
         Returns "hand" or "bench"."""
@@ -188,7 +202,7 @@ class Assistant:
             model=self.model, reasoning_effort="minimal",
             messages=[{"role": "user", "content": [
                 {"type": "text", "text": VERIFY_PROMPT.format(obj=obj)},
-                {"type": "image_url", "image_url": {"url": _jpeg_data_url(img)}},
+                {"type": "image_url", "image_url": {"url": _jpeg_data_url(img, max_side=1280)}},
             ]}],
         )
         text = resp.choices[0].message.content or ""
@@ -200,6 +214,7 @@ class Assistant:
         ok = bool(verdict.get("success", False))
         reason = str(verdict.get("reason", text.strip()[:80]))
         self.log(f"  [verify] {'success' if ok else 'FAILED'}: {reason}")
+        events.publish("verify", ok=ok, reason=reason)
         return ok, reason
 
     # ------------------------------------------------------------------ tools
@@ -210,7 +225,7 @@ class Assistant:
                 s = b.look(args["object"])
                 self.memory.note(args["object"], "seen on the bench", s.x, s.y)
                 return {"found": True, "position_cm": [round(s.x * 100, 1), round(s.y * 100, 1)],
-                        "reachable": 0.16 <= s.reach <= 0.28}
+                        "reachable": b.kin.grasp(s.x, s.y, s.z + b.gh, s.close_dir).ok}
             if name == "fetch":
                 return self._fetch(args["object"])
             if name == "pick_up":
@@ -221,6 +236,8 @@ class Assistant:
                 return self._locate(args["object"])
             if name == "put_away":
                 return self._put_away(args["object"], args.get("container") or "tray")
+            if name == "tidy_up":
+                return self._tidy_up(list(args.get("objects") or []), args.get("container") or "tray")
             if name == "hand_over":
                 held = b.holding.prompt if b.holding else "it"
                 where = self._give()
@@ -278,6 +295,19 @@ class Assistant:
         return {"found": True, "pointed_at_it": True, "within_reach": reachable,
                 "position_cm": [round(s.x * 100, 1), round(s.y * 100, 1)]}
 
+    def _tidy_up(self, objects: list[str], container: str) -> dict:
+        """Every object into the container, back to back; a failed one is skipped, not fatal."""
+        done, failed = [], {}
+        for obj in objects:
+            try:
+                self._put_away(obj, container)
+                done.append(obj)
+            except (SkillError, KeyError) as e:
+                failed[obj] = str(e).strip("'\"")
+                self.log(f"  [tidy] skipped {obj}: {failed[obj]}")
+        self._rest()
+        return {"ok": bool(done), "put_away": done, "couldnt": failed, "into": container}
+
     def _put_away(self, obj: str, container: str) -> dict:
         """Pick it up and drop it into the container; recorded as an episode like a fetch."""
         b = self.bench
@@ -311,7 +341,7 @@ class Assistant:
             rec.start(f"pick up the {obj} and hand it over")
         t0 = time.time()
         try:
-            s = b.pick(obj)
+            s = b.pick(obj, for_hand=self.hand_to_hand)
             where = self._give()
             self.memory.note(obj, "handed to the user" if where == "hand" else "put on the handover spot")
             self._rest()
@@ -322,6 +352,7 @@ class Assistant:
         ok, reason = (True, "not verified")
         if where == "hand":
             ok, reason = True, "taken from the gripper by the user"
+            events.publish("verify", ok=True, reason="dropped into your hand", by="Handover")
         elif self.verify and not b.dry_run:
             try:
                 ok, reason = self.verify_handover(obj)
@@ -344,7 +375,7 @@ class Assistant:
         user = {"role": "user", "content": [
             {"type": "text", "text": f"{text}\n\n(state: holding {holding}; saved spots: {spots}; "
                                      f"you remember: {self.memory.summary()})"},
-            {"type": "image_url", "image_url": {"url": _jpeg_data_url(bench_photo)}},
+            {"type": "image_url", "image_url": {"url": _jpeg_data_url(bench_photo, max_side=1280)}},
         ]}
         # Keep earlier turns as text only (photos are big and stale).
         messages = [{"role": "system", "content": SYSTEM}, *self.history, user]
@@ -353,6 +384,7 @@ class Assistant:
         tidied = False
         announced = False
         for _ in range(self.max_steps):
+            events.publish("status", text="Muse Spark is thinking...")
             resp = client.chat.completions.create(
                 model=self.model, messages=messages, tools=TOOLS, tool_choice="auto",
                 reasoning_effort=self.reasoning_effort,
@@ -373,10 +405,11 @@ class Assistant:
             for tc in msg.tool_calls:
                 args = json.loads(tc.function.arguments or "{}")
                 self.log(f"  [tool] {tc.function.name}({', '.join(f'{k}={v!r}' for k, v in args.items())})")
+                events.publish("tool", name=tc.function.name, args=args)
                 result = self._tool(tc.function.name, args)
                 self.log(f"         -> {result}")
                 results.append((tc.function.name, args, result))
-                tidied |= tc.function.name == "put_away"
+                tidied |= tc.function.name in ("put_away", "tidy_up")
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps(result)})
             # A successful fetch is the whole job: answer right away instead of a second model call.
             if len(results) == 1 and results[0][0] == "fetch" and results[0][2].get("ok"):
@@ -387,6 +420,16 @@ class Assistant:
                     reply = random.choice(HANDED).format(obj=obj)
                 else:
                     reply = f"I've put the {obj} down, but I'm not sure it landed in the right spot."
+                break
+            if len(results) == 1 and results[0][0] == "tidy_up":
+                r = results[0][2]
+                done, bad = r.get("put_away", []), r.get("couldnt", {})
+                if done and not bad:
+                    reply = random.choice(["All tidy!", "Done, everything's in the tray.", "Bench is clear!"])
+                elif done:
+                    reply = (f"Put away the {' and the '.join(done)}, but I couldn't manage the {', '.join(bad)}.")
+                else:
+                    reply = f"Sorry, I couldn't put any of them away: {next(iter(bad.values()), 'no idea why')}."
                 break
             # Gestures only, and we've already said something: nothing more to add.
             if spoke and all(r[0] == "gesture" and r[2].get("ok") for r in results):

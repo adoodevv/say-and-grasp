@@ -14,18 +14,26 @@ def capture(camera: str | int, mjpg: bool = False, width: int = 640, height: int
     open but unread. MJPG is opt-in: only needed when two cameras share USB bandwidth.
     """
     src = int(camera) if str(camera).isdigit() else camera
+    big = width * height > 640 * 480
     for _ in range(2):
         cap = cv2.VideoCapture(src)
-        if mjpg:
+        if mjpg or big:  # big frames need MJPG to fit through USB
             cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        if mjpg or big:
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
         frame = None
         if cap.isOpened():
-            for _ in range(8):  # let auto-exposure settle, drop stale frames
+            # Let auto-exposure (and, for big frames, autofocus) settle before keeping a frame.
+            t_end = time.time() + (1.5 if big else 0.0)
+            n = 0
+            while n < 8 or time.time() < t_end:
                 ok, f = cap.read()
+                n += 1
                 if ok:
                     frame = f
+                if n > 200:
+                    break
         cap.release()
         if frame is not None:
             return frame
