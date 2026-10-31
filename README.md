@@ -36,6 +36,7 @@ You say *"Wiggle, pass me the side cutters"*. **Muse Voice Transcribe** turns it
 
 ### Behaviour that makes it feel alive
 - **Reaches most of the bench.** Straight down where it can, and leaning the gripper in or out near its base and at the far edge, so it grasps from 10 to about 36 cm away (up to 42 cm for some tools).
+- **Looks closer when it can't see something.** If SAM 3.1 misses a thin tool in the full view, Muse Spark points out roughly where it is and SAM 3.1 looks again at a close-up of that spot.
 - **Never grabs blind.** It descends only when the wrist camera confirms the jaws are centred and square on the object.
 - **Follows a moved object.** Nudge the tool while the arm is on its way and the wrist camera sees where it went; the arm follows it and re-aligns.
 - **Recovers from a miss in place.** If the grip comes up empty, it rises, looks again and re-grabs without going back home.
@@ -81,10 +82,12 @@ sag-policy --go             # run the trained policy on the arm
 | | Trials | Success | Median time to hand over |
 |---|---|---|---|
 | Fetch into your hand (zero-shot) | 10 | 10 (100%) | 22.0 s |
-| Tidy up into the tray (zero-shot) | — | — | — |
+| Tidy up into the tray (zero-shot) | 3 runs, 12 tools | 10 tools (83%) | ~16 s per tool |
 | ACT trained on Wiggle's own episodes | — | — | — |
 
 Fetch trials: a screwdriver, tweezers (including lying on their side), a brush and a small block, placed 18–34 cm from the base in different directions and orientations, one request at a time with no help. Time runs from the typed request to the tool landing in the user's palm, including Muse Spark's decision. Of that, picking itself (overhead look, wrist alignment, grasp) took a median of 8.9 s, usually with just one or two wrist-camera checks.
+
+Tidy-up trials: four tools scattered on the bench each time, one "tidy up" request per run; Muse Spark listed the tools and the arm put them in the tray back to back. Every grasp it attempted succeeded; the two misses were the tweezers lying end-on to the camera, which SAM 3.1 didn't find in the full overhead view. Wiggle now handles that case by asking Muse Spark where the tool is and running SAM 3.1 again on a close-up of that spot.
 
 ## Hardware
 

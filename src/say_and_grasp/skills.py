@@ -22,7 +22,7 @@ import cv2
 import numpy as np
 
 from . import events
-from .arm import Arm
+from .arm import Arm, load_home
 from .calibration import (
     REACH_MAX,
     REACH_MIN,
@@ -120,6 +120,7 @@ class Bench:
         # Wrist camera alignment (sag-calibrate --wrist). Without it, picks use the overhead estimate only.
         self.wrist = json.loads(WRIST_FILE.read_text()) if WRIST_FILE.exists() else None
         self.name_hint = None  # optional: prompt -> a fuller name it was seen under before (memory)
+        self.locator = None  # optional: (frame, prompt) -> rough (u, v) of it in the frame (Muse Spark)
         # What the wrist camera keeps correcting the overhead estimate by, learned pick by pick.
         try:
             self.bias = json.loads(BIAS_FILE.read_text())
@@ -223,6 +224,8 @@ class Bench:
             if alt and alt.lower() != prompt.lower():
                 self.log(f"[look] nothing for '{prompt}'; trying '{alt}', as I last saw it")
                 dets, used = segment_robust(frame, alt, max_side=self.sam_side)
+        if not dets and self.locator:
+            dets, used = self._zoom_look(frame, prompt)
         if not dets:
             raise SkillError(f"I can't see any {prompt} on the bench.")
         dets.sort(key=lambda d: (d.confidence or 0, d.mask.sum()), reverse=True)
@@ -240,6 +243,35 @@ class Bench:
         self.log(f"[look] {prompt}: pixel ({g.u:.0f},{g.v:.0f}) -> ({x*1000:.0f}, {y*1000:.0f}) mm, "
                  f"reach {seen.reach*1000:.0f} mm" + (f" ({len(dets)} matches)" if len(dets) > 1 else ""))
         return seen
+
+    def _zoom_look(self, frame: np.ndarray, prompt: str) -> tuple[list, str]:
+        """Last try for small or thin things SAM misses in the whole view (tweezers seen end-on):
+        Muse Spark points out roughly where it is, then SAM 3.1 looks again at a close-up crop of
+        that spot, where the object is several times bigger."""
+        try:
+            spot = self.locator(frame, prompt)
+        except Exception as e:
+            self.log(f"[look] couldn't ask where the {prompt} is ({e.__class__.__name__})")
+            return [], prompt
+        if spot is None:
+            return [], prompt
+        h, w = frame.shape[:2]
+        side = int(min(h, w) * 0.45)
+        u, v = spot
+        x0 = int(np.clip(u - side / 2, 0, w - side))
+        y0 = int(np.clip(v - side / 2, 0, h - side))
+        crop = frame[y0:y0 + side, x0:x0 + side]
+        self.log(f"[look] Muse Spark says the {prompt} is near pixel ({u:.0f},{v:.0f}); zooming in")
+        dets, used = segment_robust(crop, prompt, max_side=side)
+        out = []
+        for d in dets:
+            m = np.zeros((h, w), dtype=bool)
+            m[y0:y0 + side, x0:x0 + side] = d.mask
+            l, t, r, b = d.box
+            out.append(Detection(d.object_id, (l + x0, t + y0, r + x0, b + y0), m, d.confidence))
+        if out:
+            self.log(f"[look] found it in the close-up")
+        return out, used
 
     # ------------------------------------------------------------------ planning
     def _solve(self, name: str, x: float, y: float, z: float, close_dir: float,
@@ -445,7 +477,8 @@ class Bench:
             return True, info + ", thin object"
         return False, info
 
-    def pick(self, prompt: str, retries: int = 2, pause: bool = False, for_hand: bool = False) -> Seen:
+    def pick(self, prompt: str, retries: int = 2, pause: bool = False, for_hand: bool = False,
+             frame: np.ndarray | None = None) -> Seen:
         """Find and grasp `prompt`, as one fluid motion.
 
         The overhead photo is taken while the arm is home (out of view); the arm starts lifting
@@ -455,7 +488,8 @@ class Bench:
         the object has left the wrist camera's view does it step back for a fresh overhead look.
         """
         t0 = time.time()
-        frame = self.snapshot()
+        given = frame is not None  # e.g. a clean photo from the start of a tidy-up
+        frame = self.snapshot() if frame is None else frame
         if self.dry_run:
             seen = self.look(prompt, frame)
             self._plan(seen)
@@ -463,10 +497,18 @@ class Bench:
             return seen
 
         arm = self.arm
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            fut = pool.submit(self.look, prompt, frame)
-            arm.leave_home(gripper=self.g_open)  # lift the wrist while SAM is thinking
-            seen = fut.result()
+        try:
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                fut = pool.submit(self.look, prompt, frame)
+                arm.leave_home(gripper=self.g_open)  # lift the wrist while SAM is thinking
+                seen = fut.result()
+        except SkillError:
+            # Maybe the arm itself was hiding it (mid tidy-up): move out of the way and look again.
+            if not given and np.max(np.abs(arm.q_cmd - load_home())) < 15:
+                raise
+            self.log("[pick] not found; moving out of the camera's way and looking again")
+            arm.go_clear(gripper=self.g_open)
+            seen = self.look(prompt)
         above, _ = self._plan(seen)
         arm.move(above, gripper=self.g_open, settle_s=SETTLE_PRECISE)
 
@@ -689,14 +731,15 @@ class Bench:
         self.log(f"[point] at ({px*1000:.0f}, {py*1000:.0f}) mm" + ("" if reachable else " (edge of reach)"))
         return reachable
 
-    def drop_into(self, container: str, rim_mm: float = 50.0, clearance_mm: float = 40.0) -> Seen:
+    def drop_into(self, container: str, rim_mm: float = 50.0, clearance_mm: float = 40.0,
+                  box: "Seen | None" = None) -> Seen:
         """Drop what we're holding into a container found by name ("tray", "cup", "bin").
 
         The container is found fresh each time with SAM 3.1, so it can sit anywhere in reach. The
         tool is let go `clearance_mm` above the container's rim (`rim_mm` above the table)."""
         if self.holding is None and not self.dry_run:
             raise SkillError("I'm not holding anything.")
-        box = self.look(container)
+        box = box or self.look(container)  # a tidy-up passes the tray it already found
         q, qx, qy = self._offer_pose(box.x, box.y, (rim_mm + clearance_mm) / 1000)
         if math.hypot(qx - box.x, qy - box.y) > 0.03:
             raise SkillError(f"The {container} is out of my reach; can you move it closer?")

@@ -117,12 +117,18 @@ def calibrate_wrist(args) -> None:
     """Learn where a centred object appears in the wrist camera, and how pixels map to millimetres."""
     import json
 
-    from ..skills import Bench
+    from ..skills import BIAS_FILE, Bench
 
     if not args.wrist_camera:
         sys.exit("--wrist-camera is required (e.g. 2, or a /dev/v4l/by-id/... path)")
+    # The learned overhead-vs-wrist offset is measured against this calibration: start it afresh,
+    # and don't let the old one shift where the arm hovers while calibrating.
+    if BIAS_FILE.exists():
+        BIAS_FILE.unlink()
+        print("Reset the learned overhead offset (it relearns over the first few picks).")
     bench = Bench(port=args.port, robot_id=args.robot_id, camera=args.camera)
     bench.wrist = None  # don't align while calibrating the aligner
+    bench.bias = {"dx": 0.0, "dy": 0.0, "dyaw": 0.0, "n": 0}
     cam, prompt = args.wrist_camera, args.marker
 
     last_yaw = {}

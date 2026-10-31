@@ -29,6 +29,10 @@ Answer with JSON only: {{"success": true or false, "reason": "<at most 12 words>
 
 MODEL = "muse-spark-1.3"
 
+LOCATE_PROMPT = """This is an overhead photo of a workbench. Where is the {obj}?
+Give the centre of the object as x and y from 0 to 1000 (x from the left edge, y from the top edge).
+Answer with JSON only: {{"found": true, "x": <0-1000>, "y": <0-1000>}} or {{"found": false}}"""
+
 TAKEN = ["All yours!", "There you go, one {obj}.", "Got it? Enjoy your {obj}.", "Careful, it's all yours now."]
 HANDED = ["Here you go, your {obj}.", "One {obj}, delivered!", "There you go, {obj} right by your hand.",
           "Got it, your {obj} is ready."]
@@ -163,6 +167,28 @@ class Assistant:
     def __post_init__(self):
         mem = self.memory
         self.bench.name_hint = lambda p: (mem.items[k]["name"] if (k := mem.match(p)) else None)
+        self.bench.locator = self.locate_in_photo
+
+    def locate_in_photo(self, frame: np.ndarray, obj: str) -> tuple[float, float] | None:
+        """Ask Muse Spark roughly where `obj` is in an overhead photo -> pixel (u, v), or None."""
+        h, w = frame.shape[:2]
+        resp = get_client().chat.completions.create(
+            model=self.model, reasoning_effort="low",
+            messages=[{"role": "user", "content": [
+                {"type": "text", "text": LOCATE_PROMPT.format(obj=obj)},
+                {"type": "image_url", "image_url": {"url": _jpeg_data_url(frame, max_side=1280)}},
+            ]}],
+        )
+        text = resp.choices[0].message.content or ""
+        m = re.search(r"\{.*\}", text, re.S)
+        try:
+            d = json.loads(m.group(0)) if m else {}
+        except json.JSONDecodeError:
+            d = {}
+        if not d.get("found") or "x" not in d or "y" not in d:
+            self.log(f"  [locate] Muse Spark doesn't see a {obj} either")
+            return None
+        return float(d["x"]) / 1000 * w, float(d["y"]) / 1000 * h
 
     def _give(self) -> str:
         """Hand over what we hold: into the user's hand if we see one, else onto the handover spot.
@@ -296,11 +322,18 @@ class Assistant:
                 "position_cm": [round(s.x * 100, 1), round(s.y * 100, 1)]}
 
     def _tidy_up(self, objects: list[str], container: str) -> dict:
-        """Every object into the container, back to back; a failed one is skipped, not fatal."""
+        """Every object into the container, back to back; a failed one is skipped, not fatal.
+
+        One clean overhead photo is taken first, with the arm parked: later looks would have the
+        arm (hovering over the tray) in the picture, hiding tools. The tray is found once."""
+        b = self.bench
+        clean = b.snapshot()
+        box = None
         done, failed = [], {}
         for obj in objects:
             try:
-                self._put_away(obj, container)
+                self._put_away(obj, container, frame=clean, box=box)
+                box = getattr(self, "_last_box", None) or box
                 done.append(obj)
             except (SkillError, KeyError) as e:
                 failed[obj] = str(e).strip("'\"")
@@ -308,7 +341,7 @@ class Assistant:
         self._rest()
         return {"ok": bool(done), "put_away": done, "couldnt": failed, "into": container}
 
-    def _put_away(self, obj: str, container: str) -> dict:
+    def _put_away(self, obj: str, container: str, frame=None, box=None) -> dict:
         """Pick it up and drop it into the container; recorded as an episode like a fetch."""
         b = self.bench
         rec = self.recorder
@@ -316,8 +349,8 @@ class Assistant:
             rec.start(f"put the {obj} in the {container}")
         t0 = time.time()
         try:
-            s = b.pick(obj)
-            box = b.drop_into(container)
+            s = b.pick(obj, frame=frame)
+            box = b.drop_into(container, box=box)
         except (SkillError, KeyError) as e:
             if b.holding:  # couldn't find the container: don't keep holding it
                 try:
@@ -331,6 +364,7 @@ class Assistant:
         if rec:
             rec.stop(True, {"object": obj, "container": container, "seconds": round(time.time() - t0, 1)})
         # Next tool runs straight from here (no rest pose in between): tidying up keeps moving.
+        self._last_box = box  # a tidy-up reuses where the container is
         return {"ok": True, "put_away": s.prompt, "into": container}
 
     def _fetch(self, obj: str) -> dict:
